@@ -800,7 +800,11 @@ void drawGeometryInspector(
 
             const auto oldProfile=c.profile;
             profileEditor(c.profile,c.kind==GeometryKind::Revolve,editor);
-            if(oldProfile!=c.profile)changed=true;
+            if(oldProfile.size()!=c.profile.size())changed=true;
+            else for(std::size_t i=0;i<oldProfile.size();++i)
+                if(oldProfile[i].x!=c.profile[i].x||oldProfile[i].y!=c.profile[i].y) {
+                    changed=true; break;
+                }
         }
 
         int materialIndex=materials.indexOf(c.materialId);
@@ -1244,7 +1248,14 @@ int main(int,char**) {
         if(!simulating&&showLibrary&&!blockEditor.open) {
             ImGui::SetNextWindowPos({14,82},ImGuiCond_FirstUseEver);ImGui::SetNextWindowSize({270,520},ImGuiCond_FirstUseEver);
             ImGui::Begin("Библиотека",&showLibrary);
-            if(ImGui::Button("+ Создать свой блок",{-1,0}))blockEditor.newBlock();
+            if(!blockEditor.active) {
+                if(ImGui::Button("+ Создать новый блок",{-1,0})) {
+                    enterWorkshop(blockEditor,world,camera,library,false);
+                    placedConnectionEdit=false;
+                }
+            } else {
+                ImGui::TextDisabled("Редактор блока: библиотека работает как в основной сцене.");
+            }
             ImGui::Separator();
             for(const auto& group:library.groups()) {
                 if(ImGui::CollapsingHeader(group.c_str(),ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1331,40 +1342,103 @@ int main(int,char**) {
 
         // Контекст выделения.
         if(!simulating&&!world.placing()&&!world.selection().empty()&&!blockEditor.open) {
-            ImGui::SetNextWindowPos({static_cast<float>(ww)-14.0f,82},ImGuiCond_Always,{1,0});ImGui::SetNextWindowBgAlpha(0.86f);
+            ImGui::SetNextWindowPos({static_cast<float>(ww)-14.0f,82},ImGuiCond_Always,{1,0});
+            ImGui::SetNextWindowBgAlpha(0.86f);
             ImGui::Begin("Выделение",nullptr,ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings);
             ImGui::Text("Выбрано: %zu",world.selection().size());
             ImGui::TextDisabled("Ctrl + ЛКМ — добавить к выбору\nСтрелки — X/Z, PgUp/PgDn — Y");
 
+            if(!blockEditor.active&&ImGui::Button("Сделать новым блоком",{-1,0})) {
+                enterWorkshop(blockEditor,world,camera,library,true);
+                placedConnectionEdit=false;
+            }
+
             if(world.selection().size()==1) {
-                auto id=*world.selection().begin();auto* inst=world.find(id);
+                const auto id=*world.selection().begin();
+                auto* inst=world.find(id);
                 if(inst) {
                     const auto* def=world.definitionFor(*inst,library);
                     ImGui::Separator();
                     ImGui::Text("%s  (#%llu)",def?def->nameRu.c_str():"Блок",static_cast<unsigned long long>(id));
-                    float pos[3]={inst->transform.position.x,inst->transform.position.y,inst->transform.position.z};
-                    if(ImGui::DragFloat3("Позиция",pos,0.01f,-1000,1000,"%.3f"))world.setSingleSelectedPosition({pos[0],pos[1],pos[2]});
-                    float rot[3]={inst->transform.rotationDeg.x,inst->transform.rotationDeg.y,inst->transform.rotationDeg.z};
-                    if(ImGui::DragFloat3("Поворот",rot,1.0f,-360.0f,360.0f,"%.1f°"))world.setSingleSelectedRotation({rot[0],rot[1],rot[2]});
-                    float sc[3]={inst->transform.scale.x,inst->transform.scale.y,inst->transform.scale.z};
-                    if(ImGui::DragFloat3("Масштаб",sc,0.01f,0.02f,20.0f,"%.3f"))world.setSingleSelectedScale({sc[0],sc[1],sc[2]});
 
+                    float pos[3]={inst->transform.position.x,inst->transform.position.y,inst->transform.position.z};
+                    if(ImGui::DragFloat3("Позиция",pos,0.01f,-1000,1000,"%.3f"))
+                        world.setSingleSelectedPosition({pos[0],pos[1],pos[2]});
+
+                    float rot[3]={inst->transform.rotationDeg.x,inst->transform.rotationDeg.y,inst->transform.rotationDeg.z};
+                    if(ImGui::DragFloat3("Поворот",rot,1.0f,-360,360,"%.1f°"))
+                        world.setSingleSelectedRotation({rot[0],rot[1],rot[2]});
+
+                    float scale[3]={inst->transform.scale.x,inst->transform.scale.y,inst->transform.scale.z};
+                    if(ImGui::DragFloat3("Масштаб",scale,0.01f,0.02f,20,"%.3f"))
+                        world.setSingleSelectedScale({scale[0],scale[1],scale[2]});
+
+                    def=world.definitionFor(*inst,library);
                     if(def) {
-                        const double scaleVol=std::abs(inst->transform.scale.x*inst->transform.scale.y*inst->transform.scale.z);
-                        ImGui::Text("Масса: %.3f кг",BlockLibrary::blockMassKg(*def,materials)*scaleVol);
+                        const double volumeScale=std::abs(inst->transform.scale.x*inst->transform.scale.y*inst->transform.scale.z);
+                        ImGui::Text("Масса: %.3f кг",BlockLibrary::blockMassKg(*def,materials)*volumeScale);
                         ImGui::Text("Компонентов: %zu | соединений: %zu",def->components.size(),inst->attachments.size());
-                        if(ImGui::Button("Редактировать компоненты",{-1,0}))blockEditor.editInstance(id,*def);
-                        if(inst->localOverride&&ImGui::Button("Вернуть шаблон из библиотеки",{-1,0}))world.resetLocalOverride(id);
+
+                        std::string materialId=def->components.empty()?"steel_s235":def->components.front().materialId;
+                        bool mixed=false;
+                        for(const auto& component:def->components)
+                            if(component.materialId!=materialId){mixed=true;break;}
+
+                        const char* materialLabel=mixed?"Смешанный материал":materials.get(materialId).nameRu.c_str();
+                        if(ImGui::BeginCombo("Материал блока",materialLabel)) {
+                            for(const auto& material:materials.all()) {
+                                if(ImGui::Selectable(material.nameRu.c_str(),!mixed&&material.id==materialId))
+                                    world.setInstanceMaterial(id,material.id,library);
+                            }
+                            ImGui::EndCombo();
+                        }
+                        if(!mixed) {
+                            const auto& material=materials.get(materialId);
+                            ImGui::TextDisabled("ρ %.0f кг/м³ | E %.1f ГПа | σт %.0f МПа",
+                                material.densityKgM3,material.youngModulusPa/1e9,material.yieldStrengthPa/1e6);
+                        }
+
+                        if(ImGui::Button(blockEditor.geometryInspector?"Скрыть геометрию":"Редактировать геометрию",{-1,0})) {
+                            blockEditor.geometryInspector=!blockEditor.geometryInspector;
+                            blockEditor.selectedComponent=0;
+                        }
+
+                        const bool editing=placedConnectionEdit&&placedConnectionSource==id;
+                        if(ImGui::Button(editing?"Закончить редактирование соединений":"Редактировать соединения",{-1,0})) {
+                            placedConnectionEdit=!editing;
+                            placedConnectionSource=placedConnectionEdit?id:0;
+                        }
+                        if(editing)
+                            ImGui::TextDisabled("Зелёный — соединено. Красный — только касание.\nЛКМ по соседу переключает связь.");
+
+                        if(inst->localOverride&&ImGui::Button("Вернуть шаблон из библиотеки",{-1,0}))
+                            world.resetLocalOverride(id);
                     }
                 }
+            } else {
+                blockEditor.geometryInspector=false;
+                placedConnectionEdit=false;
+                placedConnectionSource=0;
             }
 
-            if(ImGui::Button("Удалить выбранное [Del]",{-1,0}))world.deleteSelected();
+            if(ImGui::Button("Удалить выбранное [Del]",{-1,0})) {
+                world.deleteSelected();
+                blockEditor.geometryInspector=false;
+                placedConnectionEdit=false;
+                placedConnectionSource=0;
+            }
             ImGui::End();
         }
 
+        if(placedConnectionEdit&&
+           (world.selection().size()!=1||!world.isSelected(placedConnectionSource))) {
+            placedConnectionEdit=false;
+            placedConnectionSource=0;
+        }
+
+        drawGeometryInspector(blockEditor,world,library,materials,static_cast<float>(ww));
+
         if(showDebug)drawDebugPressure(pressureLab);
-        drawBlockEditor(blockEditor,library,materials,world,renderer);
 
         // Игровой клик применяется после UI.
         if(requestClick&&!simulating&&!blockEditor.open&&!io.WantCaptureMouse) {
@@ -1407,17 +1481,58 @@ int main(int,char**) {
                 }
             }
             else if(!ImGuizmo::IsUsing()&&!ImGuizmo::IsOver()) {
-                const auto id=world.pick(ray,library);
-                const bool additive=keys[SDL_SCANCODE_LCTRL]||keys[SDL_SCANCODE_RCTRL];
-                world.select(id,additive);
+                const auto clicked=world.pick(ray,library);
+                if(placedConnectionEdit) {
+                    const auto touching=world.touchingIds(placedConnectionSource,library);
+                    const bool canToggle=
+                        world.isAttached(placedConnectionSource,clicked) ||
+                        std::find(touching.begin(),touching.end(),clicked)!=touching.end();
+                    if(clicked&&canToggle)
+                        world.setAttachment(
+                            placedConnectionSource,clicked,
+                            !world.isAttached(placedConnectionSource,clicked),
+                            library
+                        );
+                } else {
+                    const bool additive=keys[SDL_SCANCODE_LCTRL]||keys[SDL_SCANCODE_RCTRL];
+                    world.select(clicked,additive);
+                }
             }
         }
         requestClick=false;
 
         if(requestToggleSim&&!blockEditor.open) {
             if(simulating){physics.clearAssemblies();simulating=false;poses.clear();}
-            else if(!world.instances().empty()){world.pruneInvalidAttachments(library);physics.buildAssemblies(world,library,materials);simulating=physics.assemblyBodyCount()>0;}
+            else if(!world.instances().empty()){
+                world.pruneInvalidAttachments(library);
+                physics.buildAssemblies(world,library,materials);
+                simulating=physics.assemblyBodyCount()>0;
+            }
             requestToggleSim=false;
+        }
+
+        if(requestSaveWorkshop&&blockEditor.active) {
+            if(simulating){physics.clearAssemblies();simulating=false;poses.clear();}
+            if(!world.instances().empty()) {
+                BlockDefinition saved=makeBlockFromScene(
+                    world,library,blockEditor.nameRu,blockEditor.group);
+                if(!saved.components.empty()) {
+                    saved.id=library.makeUniqueId(saved.nameRu);
+                    library.upsert(std::move(saved));
+                }
+            }
+            leaveWorkshop(blockEditor,world,camera);
+            world.cancelPlacement();
+            placedConnectionEdit=false;
+            requestSaveWorkshop=false;
+        }
+
+        if(requestCancelWorkshop&&blockEditor.active) {
+            if(simulating){physics.clearAssemblies();simulating=false;poses.clear();}
+            leaveWorkshop(blockEditor,world,camera);
+            world.cancelPlacement();
+            placedConnectionEdit=false;
+            requestCancelWorkshop=false;
         }
 
         altWasDown=altDown;
