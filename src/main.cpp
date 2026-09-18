@@ -68,10 +68,18 @@ struct Camera {
 };
 
 struct BlockEditorState {
+    bool active=false;
+    bool hasBackup=false;
+    BuildWorld savedWorld;
+    Camera savedCamera;
+    std::string nameRu="Новый блок";
+    std::string group="Базовые блоки";
+    bool geometryInspector=false;
+
     bool open=false;
     std::uint64_t editingInstanceId=0;
     BlockDefinition draft;
-    int selectedComponent=-1;
+    int selectedComponent=0;
     int regularSides=8;
     float regularRadius=0.30f;
     int copyBlockIndex=0;
@@ -80,13 +88,12 @@ struct BlockEditorState {
     float previewZoom=3.2f;
     int profilePoint=-1;
 
-    void newBlock() {
-        open=true;editingInstanceId=0;selectedComponent=-1;copyBlockIndex=0;
-        draft={};draft.nameRu="Новый блок";draft.group="Базовые блоки";
-    }
-    void editInstance(std::uint64_t id,const BlockDefinition& source) {
-        open=true;editingInstanceId=id;selectedComponent=source.components.empty()?-1:0;draft=source;
-        draft.id="instance_"+std::to_string(id);
+    void resetInspector() {
+        open=false;
+        editingInstanceId=0;
+        selectedComponent=0;
+        profilePoint=-1;
+        geometryInspector=false;
     }
 };
 
@@ -99,7 +106,8 @@ enum class ToolPanel {
 };
 
 struct ToolState {
-    ToolPanel panel=ToolPanel::Move;
+    ToolPanel panel=ToolPanel::None;
+    bool symmetryEnabled=false;
     bool symmetryX=false;
     bool symmetryY=false;
     bool symmetryZ=false;
@@ -119,6 +127,7 @@ std::vector<PlacementPreview> makeSymmetryPreviews(
 
     result.push_back(base);
 
+    if(!tools.symmetryEnabled)return result;
     const int masks=(tools.symmetryX?1:0)|(tools.symmetryY?2:0)|(tools.symmetryZ?4:0);
     if(masks==0)return result;
 
@@ -606,6 +615,217 @@ bool basicHotbarButton(const BlockDefinition& b,bool active) {
     const bool r=ImGui::Button(b.nameRu.c_str(),{92,46});
     if(active)ImGui::PopStyleColor();
     return r;
+}
+
+Vec3 sceneCenter(const BuildWorld& world,const BlockLibrary& library) {
+    Aabb bounds;
+    for(const auto& instance:world.instances())
+        bounds.include(world.worldBounds(instance,library));
+    return bounds.valid()?bounds.center():Vec3{};
+}
+
+BlockDefinition makeBlockFromScene(
+    const BuildWorld& world,
+    const BlockLibrary& library,
+    const std::string& name,
+    const std::string& group
+) {
+    BlockDefinition result;
+    result.nameRu=name.empty()?"Новый блок":name;
+    result.group=group.empty()?"Базовые блоки":group;
+
+    const Vec3 center=sceneCenter(world,library);
+    std::uint64_t nextId=1;
+    int nextGroup=0;
+
+    for(const auto& instance:world.instances()) {
+        const auto* source=world.definitionFor(instance,library);
+        if(!source)continue;
+
+        std::unordered_map<int,int> groups;
+        for(auto component:source->components) {
+            auto [it,inserted]=groups.emplace(component.operationGroup,nextGroup);
+            if(inserted)++nextGroup;
+            component.operationGroup=it->second;
+            component.id=nextId++;
+
+            const Vec3 local=component.position*instance.transform.scale;
+            component.position=
+                instance.transform.position+
+                rotateVectorEulerDeg(local,instance.transform.rotationDeg)-
+                center;
+            component.rotationDeg+=instance.transform.rotationDeg;
+            component.scale=component.scale*instance.transform.scale;
+            result.components.push_back(std::move(component));
+        }
+    }
+    return result;
+}
+
+void enterWorkshop(
+    BlockEditorState& editor,
+    BuildWorld& world,
+    Camera& camera,
+    const BlockLibrary& library,
+    bool fromSelection
+) {
+    editor.savedWorld=world;
+    editor.savedCamera=camera;
+    editor.hasBackup=true;
+    editor.active=true;
+    editor.nameRu=fromSelection?"Блок из выделения":"Новый блок";
+    editor.group="Базовые блоки";
+    editor.resetInspector();
+
+    BuildWorld workshop;
+    if(fromSelection&&!world.selection().empty()) {
+        const Vec3 center=world.selectionCenter(library);
+        std::unordered_map<std::uint64_t,std::uint64_t> ids;
+
+        for(const auto& instance:world.instances()) {
+            if(!world.isSelected(instance.id))continue;
+            ids[instance.id]=workshop.importInstance(instance,center*-1.0f);
+        }
+
+        for(const auto& instance:world.instances()) {
+            if(!world.isSelected(instance.id))continue;
+            for(std::uint64_t other:instance.attachments) {
+                if(other<=instance.id || !ids.contains(other))continue;
+                workshop.setAttachment(ids[instance.id],ids[other],true,library);
+            }
+        }
+    }
+
+    world=std::move(workshop);
+    camera=Camera{};
+    camera.target={0.0f,0.5f,0.0f};
+    camera.distance=8.0f;
+}
+
+void leaveWorkshop(BlockEditorState& editor,BuildWorld& world,Camera& camera) {
+    if(editor.hasBackup) {
+        world=std::move(editor.savedWorld);
+        camera=editor.savedCamera;
+    }
+    editor.active=false;
+    editor.hasBackup=false;
+    editor.resetInspector();
+}
+
+void drawGeometryInspector(
+    BlockEditorState& editor,
+    BuildWorld& world,
+    BlockLibrary& library,
+    MaterialLibrary& materials,
+    float width
+) {
+    if(!editor.geometryInspector||world.selection().size()!=1)return;
+    const auto id=*world.selection().begin();
+    auto* instance=world.find(id);
+    if(!instance)return;
+    const auto* source=world.definitionFor(*instance,library);
+    if(!source||source->components.empty())return;
+
+    BlockDefinition edited=*source;
+    editor.selectedComponent=std::clamp(
+        editor.selectedComponent,0,static_cast<int>(edited.components.size())-1);
+
+    ImGui::SetNextWindowPos({width-450.0f,375.0f},ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({435.0f,505.0f},ImGuiCond_FirstUseEver);
+    bool open=editor.geometryInspector;
+    bool changed=false;
+
+    if(ImGui::Begin("Геометрия блока",&open)) {
+        for(int i=0;i<static_cast<int>(edited.components.size());++i) {
+            auto& c=edited.components[static_cast<std::size_t>(i)];
+            if(ImGui::Selectable((c.name+"##geom"+std::to_string(c.id)).c_str(),
+                                 editor.selectedComponent==i))
+                editor.selectedComponent=i;
+        }
+
+        auto add=[&](GeometryKind kind,const char* label){
+            if(ImGui::Button(label)) {
+                edited.components.push_back(defaultComponent(kind,edited.components.size()+1));
+                editor.selectedComponent=static_cast<int>(edited.components.size())-1;
+                changed=true;
+            }
+        };
+        add(GeometryKind::Box,"+ Куб"); ImGui::SameLine();
+        add(GeometryKind::Cylinder,"+ Цилиндр"); ImGui::SameLine();
+        add(GeometryKind::Sphere,"+ Сфера");
+        add(GeometryKind::Tube,"+ Труба"); ImGui::SameLine();
+        add(GeometryKind::Extrude,"+ Контур"); ImGui::SameLine();
+        add(GeometryKind::Revolve,"+ Вращение");
+
+        auto& c=edited.components[static_cast<std::size_t>(editor.selectedComponent)];
+        ImGui::Separator();
+        changed|=ImGui::InputText("Имя",&c.name);
+
+        const char* ops[]={
+            "Объединить","Вычесть","Пересечь",
+            "Выпуклая оболочка","Сумма Минковского","Разность Минковского"
+        };
+        int op=static_cast<int>(c.booleanOp);
+        if(ImGui::Combo("Операция",&op,ops,6)) {
+            c.booleanOp=static_cast<BooleanOp>(op);
+            changed=true;
+        }
+
+        changed|=ImGui::DragFloat3("Положение",&c.position.x,0.01f,-50,50,"%.3f");
+        changed|=ImGui::DragFloat3("Поворот",&c.rotationDeg.x,1.0f,-360,360,"%.1f°");
+        changed|=ImGui::DragFloat3("Масштаб формы",&c.scale.x,0.01f,0.01f,20,"%.3f");
+
+        if(c.kind==GeometryKind::Box)
+            changed|=ImGui::DragFloat3("Размер",&c.size.x,0.01f,0.001f,50,"%.3f м");
+        else if(c.kind==GeometryKind::Cylinder||c.kind==GeometryKind::Tube) {
+            changed|=ImGui::DragFloat("Радиус",&c.radius,0.01f,0.001f,20,"%.3f м");
+            if(c.kind==GeometryKind::Tube)
+                changed|=ImGui::DragFloat("Внутренний радиус",&c.innerRadius,0.01f,0.001f,c.radius,"%.3f м");
+            changed|=ImGui::DragFloat("Высота",&c.height,0.01f,0.001f,50,"%.3f м");
+            changed|=ImGui::SliderInt("Сегментов",&c.radialSegments,16,192);
+        } else if(c.kind==GeometryKind::Sphere) {
+            changed|=ImGui::DragFloat("Радиус",&c.radius,0.01f,0.001f,20,"%.3f м");
+            changed|=ImGui::SliderInt("Сегментов",&c.radialSegments,16,192);
+        } else {
+            const char* planes[]={"XY","XZ","YZ"};
+            int plane=static_cast<int>(c.profilePlane);
+            if(ImGui::Combo("Плоскость контура",&plane,planes,3)) {
+                c.profilePlane=static_cast<ProfilePlane>(plane);
+                changed=true;
+            }
+            if(c.kind==GeometryKind::Extrude)
+                changed|=ImGui::DragFloat("Глубина",&c.size.z,0.01f,0.001f,50,"%.3f м");
+            else
+                changed|=ImGui::SliderInt("Сегментов",&c.radialSegments,16,192);
+
+            const auto oldProfile=c.profile;
+            profileEditor(c.profile,c.kind==GeometryKind::Revolve,editor);
+            if(oldProfile!=c.profile)changed=true;
+        }
+
+        int materialIndex=materials.indexOf(c.materialId);
+        const auto& all=materials.all();
+        if(ImGui::BeginCombo("Материал компонента",all[static_cast<std::size_t>(materialIndex)].nameRu.c_str())) {
+            for(int i=0;i<static_cast<int>(all.size());++i) {
+                if(ImGui::Selectable(all[static_cast<std::size_t>(i)].nameRu.c_str(),i==materialIndex)) {
+                    c.materialId=all[static_cast<std::size_t>(i)].id;
+                    changed=true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        if(edited.components.size()>1&&ImGui::Button("Удалить компонент",{-1,0})) {
+            edited.components.erase(edited.components.begin()+editor.selectedComponent);
+            editor.selectedComponent=std::min(
+                editor.selectedComponent,static_cast<int>(edited.components.size())-1);
+            changed=true;
+        }
+    }
+    ImGui::End();
+    editor.geometryInspector=open;
+
+    if(changed)world.applyLocalOverride(id,std::move(edited),library);
 }
 
 } // namespace
