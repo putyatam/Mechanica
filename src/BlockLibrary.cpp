@@ -357,3 +357,182 @@ double BlockLibrary::componentVolume(const GeometryComponent& c) {
             break;
         case GeometryKind::Cylinder:
             baseVolume=kPi*c.radius*c.radius*std::max(0.0f,c.height);
+            break;
+        case GeometryKind::Sphere:
+            baseVolume=4.0/3.0*kPi*c.radius*c.radius*c.radius;
+            break;
+        case GeometryKind::Tube:
+            baseVolume=kPi*std::max(0.0f,c.radius*c.radius-c.innerRadius*c.innerRadius)*std::max(0.0f,c.height);
+            break;
+        case GeometryKind::Extrude:
+            baseVolume=polygonArea(c.profile)*std::max(0.0f,c.size.z);
+            break;
+        case GeometryKind::Revolve: {
+            if(c.profile.size()<2) return 0.0;
+            double volume=0.0;
+            for(std::size_t i=0;i+1<c.profile.size();++i) {
+                const double r1=std::abs(c.profile[i].x);
+                const double r2=std::abs(c.profile[i+1].x);
+                const double h=std::abs(c.profile[i+1].y-c.profile[i].y);
+                volume += kPi*h*(r1*r1+r1*r2+r2*r2)/3.0;
+            }
+            baseVolume=volume;
+            break;
+        }
+    }
+    return baseVolume*scaleVolume;
+}
+
+double BlockLibrary::blockMassKg(const BlockDefinition& def, const MaterialLibrary& materials) {
+    double mass=0.0;
+
+    if(requiresCsg(def)) {
+        for(const auto& b:compileVoxelBoxes(def)) {
+            const double volume=
+                static_cast<double>(b.size.x)*
+                static_cast<double>(b.size.y)*
+                static_cast<double>(b.size.z);
+            mass+=volume*materials.get(b.materialId).densityKgM3;
+        }
+        return mass;
+    }
+
+    for(const auto& c:def.components)
+        mass += componentVolume(c)*materials.get(c.materialId).densityKgM3;
+
+    return mass;
+}
+
+bool BlockLibrary::requiresCsg(const BlockDefinition& def) {
+    for(const auto& c:def.components)
+        if(c.booleanOp!=BooleanOp::Add)return true;
+    return false;
+}
+
+namespace {
+
+Vec3 toComponentLocal(const GeometryComponent& c,Vec3 p) {
+    const Vec3 d=p-c.position;
+    const Vec3 r=c.rotationDeg*(kPi/180.0f);
+    const Mat4 inv=
+        rotationX(-r.x)*
+        rotationY(-r.y)*
+        rotationZ(-r.z);
+    Vec3 local=transformVector(inv,d);
+    local.x/=std::max(std::abs(c.scale.x),1.0e-6f);
+    local.y/=std::max(std::abs(c.scale.y),1.0e-6f);
+    local.z/=std::max(std::abs(c.scale.z),1.0e-6f);
+    return local;
+}
+
+bool pointInPolygon2D(const std::vector<Vec2>& polygon,Vec2 p) {
+    if(polygon.size()<3)return false;
+    bool inside=false;
+    for(std::size_t i=0,j=polygon.size()-1;i<polygon.size();j=i++) {
+        const auto& a=polygon[i];
+        const auto& b=polygon[j];
+        const bool crosses=((a.y>p.y)!=(b.y>p.y)) &&
+            (p.x < (b.x-a.x)*(p.y-a.y)/(b.y-a.y+1.0e-20f)+a.x);
+        if(crosses)inside=!inside;
+    }
+    return inside;
+}
+
+bool pointInside(const GeometryComponent& c,Vec3 worldPoint) {
+    const Vec3 p=toComponentLocal(c,worldPoint);
+
+    switch(c.kind) {
+        case GeometryKind::Box: {
+            const Vec3 h=c.size*0.5f;
+            return std::abs(p.x)<=h.x && std::abs(p.y)<=h.y && std::abs(p.z)<=h.z;
+        }
+        case GeometryKind::Cylinder:
+            return p.x*p.x+p.z*p.z<=c.radius*c.radius &&
+                   std::abs(p.y)<=c.height*0.5f;
+        case GeometryKind::Sphere:
+            return lengthSq(p)<=c.radius*c.radius;
+        case GeometryKind::Tube: {
+            const float r2=p.x*p.x+p.z*p.z;
+            return r2<=c.radius*c.radius &&
+                   r2>=c.innerRadius*c.innerRadius &&
+                   std::abs(p.y)<=c.height*0.5f;
+        }
+        case GeometryKind::Extrude: {
+            const float halfDepth=std::max(0.001f,c.size.z)*0.5f;
+            switch(c.profilePlane) {
+                case ProfilePlane::XY:
+                    return std::abs(p.z)<=halfDepth &&
+                           pointInPolygon2D(c.profile,{p.x,p.y});
+                case ProfilePlane::XZ:
+                    return std::abs(p.y)<=halfDepth &&
+                           pointInPolygon2D(c.profile,{p.x,p.z});
+                case ProfilePlane::YZ:
+                    return std::abs(p.x)<=halfDepth &&
+                           pointInPolygon2D(c.profile,{p.y,p.z});
+            }
+            return false;
+        }
+        case GeometryKind::Revolve: {
+            switch(c.profilePlane) {
+                case ProfilePlane::XY: {
+                    const float radius=std::sqrt(p.x*p.x+p.z*p.z);
+                    return pointInPolygon2D(c.profile,{radius,p.y});
+                }
+                case ProfilePlane::XZ: {
+                    const float radius=std::sqrt(p.x*p.x+p.y*p.y);
+                    return pointInPolygon2D(c.profile,{radius,p.z});
+                }
+                case ProfilePlane::YZ: {
+                    const float radius=std::sqrt(p.y*p.y+p.z*p.z);
+                    return pointInPolygon2D(c.profile,{radius,p.x});
+                }
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+std::vector<VoxelBox> BlockLibrary::compileVoxelBoxes(const BlockDefinition& def) {
+    std::vector<VoxelBox> result;
+    if(def.components.empty())return result;
+
+    Aabb bounds=localBounds(def);
+    if(!bounds.valid())return result;
+
+    Vec3 size=bounds.size();
+    const float longest=std::max({size.x,size.y,size.z,0.001f});
+    const int target=std::clamp(def.csgResolution,12,28);
+
+    const int nx=std::clamp(static_cast<int>(std::round(target*size.x/longest)),4,target);
+    const int ny=std::clamp(static_cast<int>(std::round(target*size.y/longest)),4,target);
+    const int nz=std::clamp(static_cast<int>(std::round(target*size.z/longest)),4,target);
+
+    const Vec3 cell{
+        size.x/static_cast<float>(nx),
+        size.y/static_cast<float>(ny),
+        size.z/static_cast<float>(nz)
+    };
+
+    const std::size_t count=
+        static_cast<std::size_t>(nx)*
+        static_cast<std::size_t>(ny)*
+        static_cast<std::size_t>(nz);
+
+    std::vector<int> material(count,-1);
+    auto index=[&](int x,int y,int z){
+        return static_cast<std::size_t>((z*ny+y)*nx+x);
+    };
+
+    std::vector<int> groupOrder;
+    groupOrder.reserve(def.components.size());
+    for(const auto& c:def.components) {
+        if(std::find(groupOrder.begin(),groupOrder.end(),c.operationGroup)==groupOrder.end())
+            groupOrder.push_back(c.operationGroup);
+    }
+
+    for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x) {
+        const Vec3 p{
+            bounds.min.x+(x+0.5f)*cell.x,
