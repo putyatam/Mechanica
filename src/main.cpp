@@ -837,7 +837,7 @@ int main(int,char**) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,3);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER,1);SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,24);
 
-    SDL_Window* window=SDL_CreateWindow("Mechanica 0.4",1500,900,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
+    SDL_Window* window=SDL_CreateWindow("Mechanica 0.5",1500,900,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
     if(!window){SDL_Quit();return 1;}
     SDL_GLContext gl=SDL_GL_CreateContext(window);
     if(!gl){SDL_DestroyWindow(window);SDL_Quit();return 1;}
@@ -868,6 +868,11 @@ int main(int,char**) {
 
     bool running=true,simulating=false,showLibrary=true,showDebug=false,rightMouse=false;
     bool requestClick=false,requestToggleSim=false;
+    bool requestSaveWorkshop=false,requestCancelWorkshop=false;
+
+    bool placedConnectionEdit=false;
+    std::uint64_t placedConnectionSource=0;
+    std::unordered_map<std::uint64_t,bool> placedConnectionChoices;
 
     bool attachmentEdit=false;
     bool altWasDown=false;
@@ -971,6 +976,27 @@ int main(int,char**) {
         if(!simulating&&world.placing())
             activePreview=attachmentEdit?&frozenPlacement:&preview;
 
+        PlacementPreview placedConnectionPreview;
+        const PlacementPreview* renderPreview=activePreview;
+        const std::unordered_map<std::uint64_t,bool>* renderAttachmentChoices=
+            activePreview?&attachChoices:nullptr;
+
+        if(!simulating&&!world.placing()&&placedConnectionEdit&&world.find(placedConnectionSource)) {
+            placedConnectionPreview.touchingIds=world.touchingIds(placedConnectionSource,library);
+            if(const auto* source=world.find(placedConnectionSource)) {
+                for(std::uint64_t attached:source->attachments)
+                    if(std::find(placedConnectionPreview.touchingIds.begin(),
+                                 placedConnectionPreview.touchingIds.end(),attached)
+                       ==placedConnectionPreview.touchingIds.end())
+                        placedConnectionPreview.touchingIds.push_back(attached);
+            }
+            placedConnectionChoices.clear();
+            for(auto id:placedConnectionPreview.touchingIds)
+                placedConnectionChoices[id]=world.isAttached(placedConnectionSource,id);
+            renderPreview=&placedConnectionPreview;
+            renderAttachmentChoices=&placedConnectionChoices;
+        }
+
         std::vector<PlacementPreview> symmetryPreviews;
         std::vector<PlacementPreview> extraSymmetryPreviews;
         if(activePreview&&!attachmentEdit) {
@@ -990,9 +1016,9 @@ int main(int,char**) {
             library,
             materials,
             vp,
-            activePreview,
+            renderPreview,
             extraSymmetryPreviews.empty()?nullptr:&extraSymmetryPreviews,
-            activePreview?&attachChoices:nullptr,
+            renderAttachmentChoices,
             simulating?&poses:nullptr
         );
 
@@ -1012,8 +1038,21 @@ int main(int,char**) {
             ImGuiWindowFlags_NoSavedSettings
         );
 
-        ImGui::TextUnformatted("MECHANICA");
+        ImGui::TextUnformatted(blockEditor.active?"MECHANICA — РЕДАКТОР БЛОКА":"MECHANICA");
         ImGui::SameLine();
+
+        if(blockEditor.active) {
+            ImGui::SetNextItemWidth(180);
+            ImGui::InputText("##workshop_name",&blockEditor.nameRu);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150);
+            ImGui::InputText("##workshop_group",&blockEditor.group);
+            ImGui::SameLine();
+            if(ImGui::Button("Сохранить"))requestSaveWorkshop=true;
+            ImGui::SameLine();
+            if(ImGui::Button("Отмена"))requestCancelWorkshop=true;
+            ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        }
 
         if(ImGui::Button(simulating?"Вернуться к сборке":"▶ Запустить"))
             requestToggleSim=true;
@@ -1027,23 +1066,31 @@ int main(int,char**) {
             ImGui::TextDisabled("|");
             ImGui::SameLine();
 
-            auto toolButton=[&](const char* label,ToolPanel panel,bool lit){
-                if(lit)ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.29f,0.49f,0.70f,1.0f));
+            auto transformTool=[&](const char* label,ToolPanel panel){
+                const bool active=tools.panel==panel;
+                if(active)ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.29f,0.49f,0.70f,1));
                 const bool clicked=ImGui::Button(label);
-                if(lit)ImGui::PopStyleColor();
-                if(clicked)tools.panel=panel;
+                if(active)ImGui::PopStyleColor();
+                if(clicked)tools.panel=active?ToolPanel::None:panel;
                 if(tools.panel==panel)
-                    toolSettingsPos=ImVec2(ImGui::GetItemRectMin().x,ImGui::GetItemRectMax().y+5.0f);
+                    toolSettingsPos={ImGui::GetItemRectMin().x,ImGui::GetItemRectMax().y+5};
             };
 
-            const bool symmetryActive=tools.symmetryX||tools.symmetryY||tools.symmetryZ;
-            toolButton("Симметрия",ToolPanel::Symmetry,symmetryActive||tools.panel==ToolPanel::Symmetry);
-            ImGui::SameLine();
-            toolButton("Поворот",ToolPanel::Rotate,tools.panel==ToolPanel::Rotate);
-            ImGui::SameLine();
-            toolButton("Перемещение",ToolPanel::Move,tools.panel==ToolPanel::Move);
-            ImGui::SameLine();
-            toolButton("Масштаб",ToolPanel::Scale,tools.panel==ToolPanel::Scale);
+            if(tools.symmetryEnabled)
+                ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.29f,0.49f,0.70f,1));
+            const bool symmetryClicked=ImGui::Button("Симметрия");
+            if(tools.symmetryEnabled)ImGui::PopStyleColor();
+            if(symmetryClicked) {
+                tools.symmetryEnabled=!tools.symmetryEnabled;
+                tools.panel=tools.symmetryEnabled?ToolPanel::Symmetry:
+                    (tools.panel==ToolPanel::Symmetry?ToolPanel::None:tools.panel);
+            }
+            if(tools.panel==ToolPanel::Symmetry)
+                toolSettingsPos={ImGui::GetItemRectMin().x,ImGui::GetItemRectMax().y+5};
+
+            ImGui::SameLine(); transformTool("Поворот",ToolPanel::Rotate);
+            ImGui::SameLine(); transformTool("Перемещение",ToolPanel::Move);
+            ImGui::SameLine(); transformTool("Масштаб",ToolPanel::Scale);
 
             ImGui::SameLine();
             ImGui::TextDisabled("|");
@@ -1269,7 +1316,7 @@ int main(int,char**) {
                 ImGui::TextDisabled("Сейчас блок ни с чем не соприкасается.");
             }
 
-            if(tools.symmetryX||tools.symmetryY||tools.symmetryZ) {
+            if(tools.symmetryEnabled&&(tools.symmetryX||tools.symmetryY||tools.symmetryZ)) {
                 ImGui::Separator();
                 ImGui::TextDisabled(
                     "Симметрия: %s%s%s",
