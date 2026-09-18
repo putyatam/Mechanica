@@ -195,6 +195,17 @@ std::uint64_t BuildWorld::place(
     return placed.id;
 }
 
+std::uint64_t BuildWorld::importInstance(const BlockInstance& source,Vec3 positionOffset) {
+    BlockInstance copy=source;
+    copy.id=nextId();
+    copy.transform.position+=positionOffset;
+    copy.attachments.clear();
+    mInstances.push_back(std::move(copy));
+    ++mRevision;
+    ++mGeometryRevision;
+    return mInstances.back().id;
+}
+
 std::uint64_t BuildWorld::pick(const Ray& ray,const BlockLibrary& library) const {
     float nearest=std::numeric_limits<float>::max();
     std::uint64_t id=0;
@@ -323,6 +334,75 @@ void BuildWorld::resetLocalOverride(std::uint64_t id) {
         ++mRevision;
         ++mGeometryRevision;
     }
+}
+
+bool BuildWorld::setInstanceMaterial(
+    std::uint64_t id,
+    const std::string& materialId,
+    const BlockLibrary& library
+) {
+    auto* instance=find(id);
+    if(!instance)return false;
+
+    const BlockDefinition* source=definitionFor(*instance,library);
+    if(!source)return false;
+
+    BlockDefinition edited=*source;
+    edited.id="instance_"+std::to_string(id);
+
+    for(auto& component:edited.components)
+        component.materialId=materialId;
+
+    instance->localOverride=std::move(edited);
+    ++mRevision;
+    ++mGeometryRevision;
+    return true;
+}
+
+std::vector<std::uint64_t> BuildWorld::touchingIds(
+    std::uint64_t id,
+    const BlockLibrary& library
+) const {
+    std::vector<std::uint64_t> result;
+    const auto* source=find(id);
+    if(!source)return result;
+
+    for(const auto& other:mInstances) {
+        if(other.id==id)continue;
+        if(areTouching(*source,other,library))
+            result.push_back(other.id);
+    }
+
+    return result;
+}
+
+bool BuildWorld::isAttached(std::uint64_t a,std::uint64_t b) const {
+    const auto* first=find(a);
+    return first && first->attachments.contains(b);
+}
+
+bool BuildWorld::setAttachment(
+    std::uint64_t a,
+    std::uint64_t b,
+    bool attached,
+    const BlockLibrary& library
+) {
+    if(a==b)return false;
+    auto* first=find(a);
+    auto* second=find(b);
+    if(!first||!second)return false;
+
+    if(attached) {
+        if(!areTouching(*first,*second,library))return false;
+        first->attachments.insert(b);
+        second->attachments.insert(a);
+    } else {
+        first->attachments.erase(b);
+        second->attachments.erase(a);
+    }
+
+    ++mRevision;
+    return true;
 }
 
 void BuildWorld::pruneInvalidAttachments(const BlockLibrary& library) {
