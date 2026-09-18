@@ -536,3 +536,134 @@ std::vector<VoxelBox> BlockLibrary::compileVoxelBoxes(const BlockDefinition& def
     for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x) {
         const Vec3 p{
             bounds.min.x+(x+0.5f)*cell.x,
+            bounds.min.y+(y+0.5f)*cell.y,
+            bounds.min.z+(z+0.5f)*cell.z
+        };
+
+        bool occupied=false;
+        int mat=-1;
+
+        for(int groupId:groupOrder) {
+            bool groupOccupied=false;
+            int groupMat=-1;
+            bool seeded=false;
+
+            for(std::size_t ci=0;ci<def.components.size();++ci) {
+                const auto& c=def.components[ci];
+                if(c.operationGroup!=groupId)continue;
+
+                const bool inside=pointInside(c,p);
+
+                if(!seeded) {
+                    groupOccupied=inside;
+                    groupMat=inside?static_cast<int>(ci):-1;
+                    seeded=true;
+                    continue;
+                }
+
+                switch(c.booleanOp) {
+                    case BooleanOp::Add:
+                    case BooleanOp::Hull:
+                    case BooleanOp::MinkowskiSum:
+                    case BooleanOp::MinkowskiDifference:
+                        if(inside){groupOccupied=true;groupMat=static_cast<int>(ci);}
+                        break;
+                    case BooleanOp::Subtract:
+                        if(inside){groupOccupied=false;groupMat=-1;}
+                        break;
+                    case BooleanOp::Intersect:
+                        if(groupOccupied&&!inside){groupOccupied=false;groupMat=-1;}
+                        break;
+                }
+            }
+
+            if(groupOccupied) {
+                occupied=true;
+                mat=groupMat;
+            }
+        }
+
+        if(occupied)material[index(x,y,z)]=mat;
+    }
+
+    std::vector<bool> used(count,false);
+
+    for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x) {
+        const auto start=index(x,y,z);
+        if(used[start]||material[start]<0)continue;
+        const int mat=material[start];
+
+        int ex=x+1;
+        while(ex<nx && !used[index(ex,y,z)] && material[index(ex,y,z)]==mat)++ex;
+
+        int ey=y+1;
+        for(;ey<ny;++ey) {
+            bool ok=true;
+            for(int xx=x;xx<ex;++xx) {
+                const auto i=index(xx,ey,z);
+                if(used[i]||material[i]!=mat){ok=false;break;}
+            }
+            if(!ok)break;
+        }
+
+        int ez=z+1;
+        for(;ez<nz;++ez) {
+            bool ok=true;
+            for(int yy=y;yy<ey&&ok;++yy)
+                for(int xx=x;xx<ex;++xx) {
+                    const auto i=index(xx,yy,ez);
+                    if(used[i]||material[i]!=mat){ok=false;break;}
+                }
+            if(!ok)break;
+        }
+
+        for(int zz=z;zz<ez;++zz)
+            for(int yy=y;yy<ey;++yy)
+                for(int xx=x;xx<ex;++xx)
+                    used[index(xx,yy,zz)]=true;
+
+        VoxelBox box;
+        box.center={
+            bounds.min.x+(x+ex)*0.5f*cell.x,
+            bounds.min.y+(y+ey)*0.5f*cell.y,
+            bounds.min.z+(z+ez)*0.5f*cell.z
+        };
+        box.size={
+            (ex-x)*cell.x,
+            (ey-y)*cell.y,
+            (ez-z)*cell.z
+        };
+        box.materialId=def.components[static_cast<std::size_t>(mat)].materialId;
+        result.push_back(std::move(box));
+    }
+
+    return result;
+}
+
+void BlockLibrary::createDefaults() {
+    mGroups={"Базовые блоки"};
+    mBlocks.clear();
+
+    auto one=[&](std::string id,std::string name,GeometryComponent c) {
+        BlockDefinition b;
+        b.id=std::move(id);
+        b.nameRu=std::move(name);
+        b.group="Базовые блоки";
+        c.id=1;
+        b.components.push_back(std::move(c));
+        mBlocks.push_back(std::move(b));
+    };
+
+    GeometryComponent c;
+
+    c={}; c.kind=GeometryKind::Box; c.name="Куб"; c.size={0.5f,0.5f,0.5f}; one("basic_cube","Куб",c);
+    c={}; c.kind=GeometryKind::Box; c.name="Балка"; c.size={1.5f,0.25f,0.25f}; one("basic_beam","Балка",c);
+    c={}; c.kind=GeometryKind::Box; c.name="Пластина"; c.size={1.5f,0.125f,1.0f}; one("basic_plate","Пластина",c);
+    c={}; c.kind=GeometryKind::Cylinder; c.name="Цилиндр"; c.radius=0.25f; c.height=0.75f; one("basic_cylinder","Цилиндр",c);
+    c={}; c.kind=GeometryKind::Sphere; c.name="Сфера"; c.radius=0.30f; one("basic_sphere","Сфера",c);
+    c={}; c.kind=GeometryKind::Tube; c.name="Труба"; c.radius=0.30f; c.innerRadius=0.20f; c.height=1.0f; one("basic_tube","Труба",c);
+
+    ++mRevision;
+}
+
+} // namespace mechanica
