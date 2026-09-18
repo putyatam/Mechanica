@@ -141,7 +141,7 @@ void addComponent(
     const GeometryComponent& c,
     const MaterialDefinition& mat
 ) {
-    const Vec3 sc=maxVec(instance.transform.scale,{0.001f,0.001f,0.001f});
+    const Vec3 sc=maxVec(instance.transform.scale*c.scale,{0.001f,0.001f,0.001f});
     const Vec3 pos=worldComponentPosition(instance,c)-assemblyOrigin;
     const Quat rot=eulerQuat(instance.transform.rotationDeg)*eulerQuat(c.rotationDeg);
     const float density=static_cast<float>(mat.densityKgM3);
@@ -226,11 +226,30 @@ void addComponent(
         }
         case GeometryKind::Extrude: {
             std::vector<JPH::Vec3> pts;
-            const float z=c.size.z*sc.z*0.5f;
+
             for(const auto& p:c.profile) {
-                pts.emplace_back(p.x*sc.x,p.y*sc.y,-z);
-                pts.emplace_back(p.x*sc.x,p.y*sc.y, z);
+                switch(c.profilePlane) {
+                    case ProfilePlane::XY: {
+                        const float d=c.size.z*sc.z*0.5f;
+                        pts.emplace_back(p.x*sc.x,p.y*sc.y,-d);
+                        pts.emplace_back(p.x*sc.x,p.y*sc.y, d);
+                        break;
+                    }
+                    case ProfilePlane::XZ: {
+                        const float d=c.size.z*sc.y*0.5f;
+                        pts.emplace_back(p.x*sc.x,-d,p.y*sc.z);
+                        pts.emplace_back(p.x*sc.x, d,p.y*sc.z);
+                        break;
+                    }
+                    case ProfilePlane::YZ: {
+                        const float d=c.size.z*sc.x*0.5f;
+                        pts.emplace_back(-d,p.x*sc.y,p.y*sc.z);
+                        pts.emplace_back( d,p.x*sc.y,p.y*sc.z);
+                        break;
+                    }
+                }
             }
+
             ShapeRefC hull=makeConvexHull(pts,density);
             if(!hull) {
                 BlockDefinition temporary;
@@ -244,11 +263,40 @@ void addComponent(
         }
         case GeometryKind::Revolve: {
             std::vector<JPH::Vec3> pts;
-            const int n=std::clamp(c.radialSegments,12,48);
-            for(const auto& p:c.profile)for(int k=0;k<n;++k){
-                const float a=2*kPi*k/n;
-                pts.emplace_back(p.x*sc.x*std::cos(a),p.y*sc.y,p.x*sc.z*std::sin(a));
+            const int n=std::clamp(c.radialSegments,16,64);
+
+            for(const auto& p:c.profile) {
+                for(int k=0;k<n;++k) {
+                    const float a=2*kPi*k/n;
+                    const float ca=std::cos(a);
+                    const float sa=std::sin(a);
+
+                    switch(c.profilePlane) {
+                        case ProfilePlane::XY:
+                            pts.emplace_back(
+                                p.x*sc.x*ca,
+                                p.y*sc.y,
+                                p.x*sc.z*sa
+                            );
+                            break;
+                        case ProfilePlane::XZ:
+                            pts.emplace_back(
+                                p.x*sc.x*ca,
+                                p.x*sc.y*sa,
+                                p.y*sc.z
+                            );
+                            break;
+                        case ProfilePlane::YZ:
+                            pts.emplace_back(
+                                p.y*sc.x,
+                                p.x*sc.y*ca,
+                                p.x*sc.z*sa
+                            );
+                            break;
+                    }
+                }
             }
+
             ShapeRefC hull=makeConvexHull(pts,density);
             if(!hull) addDefault(fallbackBox({0.25f,0.25f,0.25f},density));
             else addDefault(hull);
