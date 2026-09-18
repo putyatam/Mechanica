@@ -177,3 +177,183 @@ std::vector<Vec2> makeRegularPolygon(int sides, float radius) {
         const float a=2.0f*kPi*static_cast<float>(i)/static_cast<float>(sides);
         result.push_back({std::cos(a)*radius,std::sin(a)*radius});
     }
+    return result;
+}
+
+BlockLibrary::BlockLibrary(std::filesystem::path storagePath)
+    : mStoragePath(std::move(storagePath)) {}
+
+bool BlockLibrary::loadOrCreateDefaults() {
+    if(!std::filesystem::exists(mStoragePath)) {
+        createDefaults();
+        return save();
+    }
+
+    try {
+        std::ifstream in(mStoragePath);
+        if(!in) return false;
+        json root; in>>root;
+
+        mGroups.clear();
+        mBlocks.clear();
+
+        for(const auto& g:root.value("groups",json::array()))
+            if(g.is_string()) mGroups.push_back(g.get<std::string>());
+
+        for(const auto& jb:root.value("blocks",json::array())) {
+            BlockDefinition b;
+            b.id=jb.value("id","");
+            b.nameRu=jb.value("nameRu","Без имени");
+            b.group=jb.value("group","Базовые блоки");
+            b.csgResolution=std::clamp(jb.value("csgResolution",20),12,32);
+
+            for(const auto& jc:jb.value("components",json::array())) {
+                GeometryComponent c;
+                c.id=jc.value("id",0ull);
+                c.name=jc.value("name","Компонент");
+                c.kind=parseKind(jc.value("kind","box"));
+                c.booleanOp=parseBoolean(jc.value("booleanOp","add"));
+                c.operationGroup=jc.value("operationGroup",0);
+                c.position=readVec3(jc.value("position",json::array()));
+                c.rotationDeg=readVec3(jc.value("rotationDeg",json::array()));
+                c.scale=readVec3(jc.value("scale",json::array({1.0,1.0,1.0})),{1.0f,1.0f,1.0f});
+                c.size=readVec3(jc.value("size",json::array({0.5,0.5,0.5})),{0.5f,0.5f,0.5f});
+                c.radius=jc.value("radius",0.25f);
+                c.innerRadius=jc.value("innerRadius",0.15f);
+                c.height=jc.value("height",0.5f);
+                c.radialSegments=jc.value("radialSegments",24);
+                c.materialId=jc.value("materialId","steel_s235");
+                c.profilePlane=parsePlane(jc.value("profilePlane","xy"));
+                for(const auto& p:jc.value("profile",json::array())) c.profile.push_back(readVec2(p));
+                b.components.push_back(std::move(c));
+            }
+
+            if(!b.id.empty() && !b.components.empty()) mBlocks.push_back(std::move(b));
+        }
+
+        if(mGroups.empty()) mGroups.push_back("Базовые блоки");
+        if(mBlocks.empty()) createDefaults();
+        ++mRevision;
+        return true;
+    } catch(...) {
+        createDefaults();
+        return save();
+    }
+}
+
+bool BlockLibrary::save() const {
+    try {
+        std::filesystem::create_directories(mStoragePath.parent_path());
+
+        json root;
+        root["version"]=1;
+        root["groups"]=mGroups;
+        root["blocks"]=json::array();
+
+        for(const auto& b:mBlocks) {
+            json jb;
+            jb["id"]=b.id;
+            jb["nameRu"]=b.nameRu;
+            jb["group"]=b.group;
+            jb["csgResolution"]=b.csgResolution;
+            jb["components"]=json::array();
+
+            for(const auto& c:b.components) {
+                json jc;
+                jc["id"]=c.id;
+                jc["name"]=c.name;
+                jc["kind"]=kindName(c.kind);
+                jc["booleanOp"]=booleanName(c.booleanOp);
+                jc["operationGroup"]=c.operationGroup;
+                jc["position"]=vec3Json(c.position);
+                jc["rotationDeg"]=vec3Json(c.rotationDeg);
+                jc["scale"]=vec3Json(c.scale);
+                jc["size"]=vec3Json(c.size);
+                jc["radius"]=c.radius;
+                jc["innerRadius"]=c.innerRadius;
+                jc["height"]=c.height;
+                jc["radialSegments"]=c.radialSegments;
+                jc["materialId"]=c.materialId;
+                jc["profilePlane"]=planeName(c.profilePlane);
+                jc["profile"]=json::array();
+                for(const auto& p:c.profile) jc["profile"].push_back(vec2Json(p));
+                jb["components"].push_back(std::move(jc));
+            }
+            root["blocks"].push_back(std::move(jb));
+        }
+
+        std::ofstream out(mStoragePath);
+        if(!out) return false;
+        out<<std::setw(2)<<root<<"\n";
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
+const BlockDefinition* BlockLibrary::find(std::string_view id) const {
+    for(const auto& b:mBlocks) if(b.id==id) return &b;
+    return nullptr;
+}
+BlockDefinition* BlockLibrary::findMutable(std::string_view id) {
+    for(auto& b:mBlocks) if(b.id==id) return &b;
+    return nullptr;
+}
+
+void BlockLibrary::addGroup(std::string name) {
+    if(name.empty()) return;
+    if(std::find(mGroups.begin(),mGroups.end(),name)==mGroups.end()) {
+        mGroups.push_back(std::move(name));
+        ++mRevision;
+        save();
+    }
+}
+
+void BlockLibrary::upsert(BlockDefinition block) {
+    if(block.id.empty()) block.id=makeUniqueId(block.nameRu);
+    if(block.group.empty()) block.group="Базовые блоки";
+    addGroup(block.group);
+
+    if(auto* existing=findMutable(block.id)) *existing=std::move(block);
+    else mBlocks.push_back(std::move(block));
+
+    ++mRevision;
+    save();
+}
+
+std::string BlockLibrary::makeUniqueId(std::string_view base) const {
+    std::string cleaned;
+    for(unsigned char ch:std::string(base)) {
+        if((ch>='a'&&ch<='z')||(ch>='A'&&ch<='Z')||(ch>='0'&&ch<='9')) cleaned.push_back(static_cast<char>(std::tolower(ch)));
+        else if(ch==' '||ch=='-'||ch=='_') cleaned.push_back('_');
+    }
+    if(cleaned.empty()) cleaned="user_block";
+
+    std::string candidate=cleaned;
+    int suffix=2;
+    while(find(candidate)) candidate=cleaned+"_"+std::to_string(suffix++);
+    return candidate;
+}
+
+Aabb BlockLibrary::localBounds(const BlockDefinition& def) {
+    Aabb result;
+    for(const auto& c:def.components) result.include(componentBounds(c));
+    if(!result.valid()) {
+        result.include({-0.25f,-0.25f,-0.25f});
+        result.include({0.25f,0.25f,0.25f});
+    }
+    return result;
+}
+
+double BlockLibrary::componentVolume(const GeometryComponent& c) {
+    const double scaleVolume=
+        std::abs(static_cast<double>(c.scale.x)*
+                 static_cast<double>(c.scale.y)*
+                 static_cast<double>(c.scale.z));
+    double baseVolume=0.0;
+    switch(c.kind) {
+        case GeometryKind::Box:
+            baseVolume=std::max(0.0f,c.size.x)*std::max(0.0f,c.size.y)*std::max(0.0f,c.size.z);
+            break;
+        case GeometryKind::Cylinder:
+            baseVolume=kPi*c.radius*c.radius*std::max(0.0f,c.height);
