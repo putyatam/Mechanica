@@ -15,11 +15,7 @@ struct BlockInstance {
     std::uint64_t id = 0;
     std::string definitionId;
     Transform transform{};
-
-    // If present, this instance has been edited independently from the library template.
     std::optional<BlockDefinition> localOverride;
-
-    // Explicit rigid attachments. They are always symmetric.
     std::unordered_set<std::uint64_t> attachments;
 };
 
@@ -60,6 +56,7 @@ public:
         const std::vector<std::uint64_t>& attachTo,
         const BlockLibrary& library
     );
+    std::uint64_t importInstance(const BlockInstance& source, Vec3 positionOffset={});
 
     [[nodiscard]] std::uint64_t pick(const Ray& ray, const BlockLibrary& library) const;
 
@@ -83,6 +80,11 @@ public:
 
     void applyLocalOverride(std::uint64_t id, BlockDefinition definition, const BlockLibrary& library);
     void resetLocalOverride(std::uint64_t id);
+    bool setInstanceMaterial(std::uint64_t id, const std::string& materialId, const BlockLibrary& library);
+
+    [[nodiscard]] std::vector<std::uint64_t> touchingIds(std::uint64_t id, const BlockLibrary& library) const;
+    [[nodiscard]] bool isAttached(std::uint64_t a, std::uint64_t b) const;
+    bool setAttachment(std::uint64_t a, std::uint64_t b, bool attached, const BlockLibrary& library);
 
     void pruneInvalidAttachments(const BlockLibrary& library);
 

@@ -68,10 +68,18 @@ struct Camera {
 };
 
 struct BlockEditorState {
+    bool active=false;
+    bool hasBackup=false;
+    BuildWorld savedWorld;
+    Camera savedCamera;
+    std::string nameRu="Новый блок";
+    std::string group="Базовые блоки";
+    bool geometryInspector=false;
+
     bool open=false;
     std::uint64_t editingInstanceId=0;
     BlockDefinition draft;
-    int selectedComponent=-1;
+    int selectedComponent=0;
     int regularSides=8;
     float regularRadius=0.30f;
     int copyBlockIndex=0;
@@ -80,13 +88,12 @@ struct BlockEditorState {
     float previewZoom=3.2f;
     int profilePoint=-1;
 
-    void newBlock() {
-        open=true;editingInstanceId=0;selectedComponent=-1;copyBlockIndex=0;
-        draft={};draft.nameRu="Новый блок";draft.group="Базовые блоки";
-    }
-    void editInstance(std::uint64_t id,const BlockDefinition& source) {
-        open=true;editingInstanceId=id;selectedComponent=source.components.empty()?-1:0;draft=source;
-        draft.id="instance_"+std::to_string(id);
+    void resetInspector() {
+        open=false;
+        editingInstanceId=0;
+        selectedComponent=0;
+        profilePoint=-1;
+        geometryInspector=false;
     }
 };
 
@@ -99,7 +106,8 @@ enum class ToolPanel {
 };
 
 struct ToolState {
-    ToolPanel panel=ToolPanel::Move;
+    ToolPanel panel=ToolPanel::None;
+    bool symmetryEnabled=false;
     bool symmetryX=false;
     bool symmetryY=false;
     bool symmetryZ=false;
@@ -119,6 +127,7 @@ std::vector<PlacementPreview> makeSymmetryPreviews(
 
     result.push_back(base);
 
+    if(!tools.symmetryEnabled)return result;
     const int masks=(tools.symmetryX?1:0)|(tools.symmetryY?2:0)|(tools.symmetryZ?4:0);
     if(masks==0)return result;
 
@@ -608,6 +617,221 @@ bool basicHotbarButton(const BlockDefinition& b,bool active) {
     return r;
 }
 
+Vec3 sceneCenter(const BuildWorld& world,const BlockLibrary& library) {
+    Aabb bounds;
+    for(const auto& instance:world.instances())
+        bounds.include(world.worldBounds(instance,library));
+    return bounds.valid()?bounds.center():Vec3{};
+}
+
+BlockDefinition makeBlockFromScene(
+    const BuildWorld& world,
+    const BlockLibrary& library,
+    const std::string& name,
+    const std::string& group
+) {
+    BlockDefinition result;
+    result.nameRu=name.empty()?"Новый блок":name;
+    result.group=group.empty()?"Базовые блоки":group;
+
+    const Vec3 center=sceneCenter(world,library);
+    std::uint64_t nextId=1;
+    int nextGroup=0;
+
+    for(const auto& instance:world.instances()) {
+        const auto* source=world.definitionFor(instance,library);
+        if(!source)continue;
+
+        std::unordered_map<int,int> groups;
+        for(auto component:source->components) {
+            auto [it,inserted]=groups.emplace(component.operationGroup,nextGroup);
+            if(inserted)++nextGroup;
+            component.operationGroup=it->second;
+            component.id=nextId++;
+
+            const Vec3 local=component.position*instance.transform.scale;
+            component.position=
+                instance.transform.position+
+                rotateVectorEulerDeg(local,instance.transform.rotationDeg)-
+                center;
+            component.rotationDeg+=instance.transform.rotationDeg;
+            component.scale=component.scale*instance.transform.scale;
+            result.components.push_back(std::move(component));
+        }
+    }
+    return result;
+}
+
+void enterWorkshop(
+    BlockEditorState& editor,
+    BuildWorld& world,
+    Camera& camera,
+    const BlockLibrary& library,
+    bool fromSelection
+) {
+    editor.savedWorld=world;
+    editor.savedCamera=camera;
+    editor.hasBackup=true;
+    editor.active=true;
+    editor.nameRu=fromSelection?"Блок из выделения":"Новый блок";
+    editor.group="Базовые блоки";
+    editor.resetInspector();
+
+    BuildWorld workshop;
+    if(fromSelection&&!world.selection().empty()) {
+        const Vec3 center=world.selectionCenter(library);
+        std::unordered_map<std::uint64_t,std::uint64_t> ids;
+
+        for(const auto& instance:world.instances()) {
+            if(!world.isSelected(instance.id))continue;
+            ids[instance.id]=workshop.importInstance(instance,center*-1.0f);
+        }
+
+        for(const auto& instance:world.instances()) {
+            if(!world.isSelected(instance.id))continue;
+            for(std::uint64_t other:instance.attachments) {
+                if(other<=instance.id || !ids.contains(other))continue;
+                workshop.setAttachment(ids[instance.id],ids[other],true,library);
+            }
+        }
+    }
+
+    world=std::move(workshop);
+    camera=Camera{};
+    camera.target={0.0f,0.5f,0.0f};
+    camera.distance=8.0f;
+}
+
+void leaveWorkshop(BlockEditorState& editor,BuildWorld& world,Camera& camera) {
+    if(editor.hasBackup) {
+        world=std::move(editor.savedWorld);
+        camera=editor.savedCamera;
+    }
+    editor.active=false;
+    editor.hasBackup=false;
+    editor.resetInspector();
+}
+
+void drawGeometryInspector(
+    BlockEditorState& editor,
+    BuildWorld& world,
+    BlockLibrary& library,
+    MaterialLibrary& materials,
+    float width
+) {
+    if(!editor.geometryInspector||world.selection().size()!=1)return;
+    const auto id=*world.selection().begin();
+    auto* instance=world.find(id);
+    if(!instance)return;
+    const auto* source=world.definitionFor(*instance,library);
+    if(!source||source->components.empty())return;
+
+    BlockDefinition edited=*source;
+    editor.selectedComponent=std::clamp(
+        editor.selectedComponent,0,static_cast<int>(edited.components.size())-1);
+
+    ImGui::SetNextWindowPos({width-450.0f,375.0f},ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({435.0f,505.0f},ImGuiCond_FirstUseEver);
+    bool open=editor.geometryInspector;
+    bool changed=false;
+
+    if(ImGui::Begin("Геометрия блока",&open)) {
+        for(int i=0;i<static_cast<int>(edited.components.size());++i) {
+            auto& c=edited.components[static_cast<std::size_t>(i)];
+            if(ImGui::Selectable((c.name+"##geom"+std::to_string(c.id)).c_str(),
+                                 editor.selectedComponent==i))
+                editor.selectedComponent=i;
+        }
+
+        auto add=[&](GeometryKind kind,const char* label){
+            if(ImGui::Button(label)) {
+                edited.components.push_back(defaultComponent(kind,edited.components.size()+1));
+                editor.selectedComponent=static_cast<int>(edited.components.size())-1;
+                changed=true;
+            }
+        };
+        add(GeometryKind::Box,"+ Куб"); ImGui::SameLine();
+        add(GeometryKind::Cylinder,"+ Цилиндр"); ImGui::SameLine();
+        add(GeometryKind::Sphere,"+ Сфера");
+        add(GeometryKind::Tube,"+ Труба"); ImGui::SameLine();
+        add(GeometryKind::Extrude,"+ Контур"); ImGui::SameLine();
+        add(GeometryKind::Revolve,"+ Вращение");
+
+        auto& c=edited.components[static_cast<std::size_t>(editor.selectedComponent)];
+        ImGui::Separator();
+        changed|=ImGui::InputText("Имя",&c.name);
+
+        const char* ops[]={
+            "Объединить","Вычесть","Пересечь",
+            "Выпуклая оболочка","Сумма Минковского","Разность Минковского"
+        };
+        int op=static_cast<int>(c.booleanOp);
+        if(ImGui::Combo("Операция",&op,ops,6)) {
+            c.booleanOp=static_cast<BooleanOp>(op);
+            changed=true;
+        }
+
+        changed|=ImGui::DragFloat3("Положение",&c.position.x,0.01f,-50,50,"%.3f");
+        changed|=ImGui::DragFloat3("Поворот",&c.rotationDeg.x,1.0f,-360,360,"%.1f°");
+        changed|=ImGui::DragFloat3("Масштаб формы",&c.scale.x,0.01f,0.01f,20,"%.3f");
+
+        if(c.kind==GeometryKind::Box)
+            changed|=ImGui::DragFloat3("Размер",&c.size.x,0.01f,0.001f,50,"%.3f м");
+        else if(c.kind==GeometryKind::Cylinder||c.kind==GeometryKind::Tube) {
+            changed|=ImGui::DragFloat("Радиус",&c.radius,0.01f,0.001f,20,"%.3f м");
+            if(c.kind==GeometryKind::Tube)
+                changed|=ImGui::DragFloat("Внутренний радиус",&c.innerRadius,0.01f,0.001f,c.radius,"%.3f м");
+            changed|=ImGui::DragFloat("Высота",&c.height,0.01f,0.001f,50,"%.3f м");
+            changed|=ImGui::SliderInt("Сегментов",&c.radialSegments,16,192);
+        } else if(c.kind==GeometryKind::Sphere) {
+            changed|=ImGui::DragFloat("Радиус",&c.radius,0.01f,0.001f,20,"%.3f м");
+            changed|=ImGui::SliderInt("Сегментов",&c.radialSegments,16,192);
+        } else {
+            const char* planes[]={"XY","XZ","YZ"};
+            int plane=static_cast<int>(c.profilePlane);
+            if(ImGui::Combo("Плоскость контура",&plane,planes,3)) {
+                c.profilePlane=static_cast<ProfilePlane>(plane);
+                changed=true;
+            }
+            if(c.kind==GeometryKind::Extrude)
+                changed|=ImGui::DragFloat("Глубина",&c.size.z,0.01f,0.001f,50,"%.3f м");
+            else
+                changed|=ImGui::SliderInt("Сегментов",&c.radialSegments,16,192);
+
+            const auto oldProfile=c.profile;
+            profileEditor(c.profile,c.kind==GeometryKind::Revolve,editor);
+            if(oldProfile.size()!=c.profile.size())changed=true;
+            else for(std::size_t i=0;i<oldProfile.size();++i)
+                if(oldProfile[i].x!=c.profile[i].x||oldProfile[i].y!=c.profile[i].y) {
+                    changed=true; break;
+                }
+        }
+
+        int materialIndex=materials.indexOf(c.materialId);
+        const auto& all=materials.all();
+        if(ImGui::BeginCombo("Материал компонента",all[static_cast<std::size_t>(materialIndex)].nameRu.c_str())) {
+            for(int i=0;i<static_cast<int>(all.size());++i) {
+                if(ImGui::Selectable(all[static_cast<std::size_t>(i)].nameRu.c_str(),i==materialIndex)) {
+                    c.materialId=all[static_cast<std::size_t>(i)].id;
+                    changed=true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        if(edited.components.size()>1&&ImGui::Button("Удалить компонент",{-1,0})) {
+            edited.components.erase(edited.components.begin()+editor.selectedComponent);
+            editor.selectedComponent=std::min(
+                editor.selectedComponent,static_cast<int>(edited.components.size())-1);
+            changed=true;
+        }
+    }
+    ImGui::End();
+    editor.geometryInspector=open;
+
+    if(changed)world.applyLocalOverride(id,std::move(edited),library);
+}
+
 } // namespace
 
 int main(int,char**) {
@@ -617,7 +841,7 @@ int main(int,char**) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,3);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER,1);SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,24);
 
-    SDL_Window* window=SDL_CreateWindow("Mechanica 0.4",1500,900,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
+    SDL_Window* window=SDL_CreateWindow("Mechanica 0.5",1500,900,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
     if(!window){SDL_Quit();return 1;}
     SDL_GLContext gl=SDL_GL_CreateContext(window);
     if(!gl){SDL_DestroyWindow(window);SDL_Quit();return 1;}
@@ -648,6 +872,11 @@ int main(int,char**) {
 
     bool running=true,simulating=false,showLibrary=true,showDebug=false,rightMouse=false;
     bool requestClick=false,requestToggleSim=false;
+    bool requestSaveWorkshop=false,requestCancelWorkshop=false;
+
+    bool placedConnectionEdit=false;
+    std::uint64_t placedConnectionSource=0;
+    std::unordered_map<std::uint64_t,bool> placedConnectionChoices;
 
     bool attachmentEdit=false;
     bool altWasDown=false;
@@ -751,6 +980,27 @@ int main(int,char**) {
         if(!simulating&&world.placing())
             activePreview=attachmentEdit?&frozenPlacement:&preview;
 
+        PlacementPreview placedConnectionPreview;
+        const PlacementPreview* renderPreview=activePreview;
+        const std::unordered_map<std::uint64_t,bool>* renderAttachmentChoices=
+            activePreview?&attachChoices:nullptr;
+
+        if(!simulating&&!world.placing()&&placedConnectionEdit&&world.find(placedConnectionSource)) {
+            placedConnectionPreview.touchingIds=world.touchingIds(placedConnectionSource,library);
+            if(const auto* source=world.find(placedConnectionSource)) {
+                for(std::uint64_t attached:source->attachments)
+                    if(std::find(placedConnectionPreview.touchingIds.begin(),
+                                 placedConnectionPreview.touchingIds.end(),attached)
+                       ==placedConnectionPreview.touchingIds.end())
+                        placedConnectionPreview.touchingIds.push_back(attached);
+            }
+            placedConnectionChoices.clear();
+            for(auto id:placedConnectionPreview.touchingIds)
+                placedConnectionChoices[id]=world.isAttached(placedConnectionSource,id);
+            renderPreview=&placedConnectionPreview;
+            renderAttachmentChoices=&placedConnectionChoices;
+        }
+
         std::vector<PlacementPreview> symmetryPreviews;
         std::vector<PlacementPreview> extraSymmetryPreviews;
         if(activePreview&&!attachmentEdit) {
@@ -770,9 +1020,9 @@ int main(int,char**) {
             library,
             materials,
             vp,
-            activePreview,
+            renderPreview,
             extraSymmetryPreviews.empty()?nullptr:&extraSymmetryPreviews,
-            activePreview?&attachChoices:nullptr,
+            renderAttachmentChoices,
             simulating?&poses:nullptr
         );
 
@@ -792,8 +1042,21 @@ int main(int,char**) {
             ImGuiWindowFlags_NoSavedSettings
         );
 
-        ImGui::TextUnformatted("MECHANICA");
+        ImGui::TextUnformatted(blockEditor.active?"MECHANICA — РЕДАКТОР БЛОКА":"MECHANICA");
         ImGui::SameLine();
+
+        if(blockEditor.active) {
+            ImGui::SetNextItemWidth(180);
+            ImGui::InputText("##workshop_name",&blockEditor.nameRu);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150);
+            ImGui::InputText("##workshop_group",&blockEditor.group);
+            ImGui::SameLine();
+            if(ImGui::Button("Сохранить"))requestSaveWorkshop=true;
+            ImGui::SameLine();
+            if(ImGui::Button("Отмена"))requestCancelWorkshop=true;
+            ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        }
 
         if(ImGui::Button(simulating?"Вернуться к сборке":"▶ Запустить"))
             requestToggleSim=true;
@@ -807,23 +1070,31 @@ int main(int,char**) {
             ImGui::TextDisabled("|");
             ImGui::SameLine();
 
-            auto toolButton=[&](const char* label,ToolPanel panel,bool lit){
-                if(lit)ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.29f,0.49f,0.70f,1.0f));
+            auto transformTool=[&](const char* label,ToolPanel panel){
+                const bool active=tools.panel==panel;
+                if(active)ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.29f,0.49f,0.70f,1));
                 const bool clicked=ImGui::Button(label);
-                if(lit)ImGui::PopStyleColor();
-                if(clicked)tools.panel=panel;
+                if(active)ImGui::PopStyleColor();
+                if(clicked)tools.panel=active?ToolPanel::None:panel;
                 if(tools.panel==panel)
-                    toolSettingsPos=ImVec2(ImGui::GetItemRectMin().x,ImGui::GetItemRectMax().y+5.0f);
+                    toolSettingsPos={ImGui::GetItemRectMin().x,ImGui::GetItemRectMax().y+5};
             };
 
-            const bool symmetryActive=tools.symmetryX||tools.symmetryY||tools.symmetryZ;
-            toolButton("Симметрия",ToolPanel::Symmetry,symmetryActive||tools.panel==ToolPanel::Symmetry);
-            ImGui::SameLine();
-            toolButton("Поворот",ToolPanel::Rotate,tools.panel==ToolPanel::Rotate);
-            ImGui::SameLine();
-            toolButton("Перемещение",ToolPanel::Move,tools.panel==ToolPanel::Move);
-            ImGui::SameLine();
-            toolButton("Масштаб",ToolPanel::Scale,tools.panel==ToolPanel::Scale);
+            if(tools.symmetryEnabled)
+                ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.29f,0.49f,0.70f,1));
+            const bool symmetryClicked=ImGui::Button("Симметрия");
+            if(tools.symmetryEnabled)ImGui::PopStyleColor();
+            if(symmetryClicked) {
+                tools.symmetryEnabled=!tools.symmetryEnabled;
+                tools.panel=tools.symmetryEnabled?ToolPanel::Symmetry:
+                    (tools.panel==ToolPanel::Symmetry?ToolPanel::None:tools.panel);
+            }
+            if(tools.panel==ToolPanel::Symmetry)
+                toolSettingsPos={ImGui::GetItemRectMin().x,ImGui::GetItemRectMax().y+5};
+
+            ImGui::SameLine(); transformTool("Поворот",ToolPanel::Rotate);
+            ImGui::SameLine(); transformTool("Перемещение",ToolPanel::Move);
+            ImGui::SameLine(); transformTool("Масштаб",ToolPanel::Scale);
 
             ImGui::SameLine();
             ImGui::TextDisabled("|");
@@ -977,7 +1248,14 @@ int main(int,char**) {
         if(!simulating&&showLibrary&&!blockEditor.open) {
             ImGui::SetNextWindowPos({14,82},ImGuiCond_FirstUseEver);ImGui::SetNextWindowSize({270,520},ImGuiCond_FirstUseEver);
             ImGui::Begin("Библиотека",&showLibrary);
-            if(ImGui::Button("+ Создать свой блок",{-1,0}))blockEditor.newBlock();
+            if(!blockEditor.active) {
+                if(ImGui::Button("+ Создать новый блок",{-1,0})) {
+                    enterWorkshop(blockEditor,world,camera,library,false);
+                    placedConnectionEdit=false;
+                }
+            } else {
+                ImGui::TextDisabled("Редактор блока: библиотека работает как в основной сцене.");
+            }
             ImGui::Separator();
             for(const auto& group:library.groups()) {
                 if(ImGui::CollapsingHeader(group.c_str(),ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1049,7 +1327,7 @@ int main(int,char**) {
                 ImGui::TextDisabled("Сейчас блок ни с чем не соприкасается.");
             }
 
-            if(tools.symmetryX||tools.symmetryY||tools.symmetryZ) {
+            if(tools.symmetryEnabled&&(tools.symmetryX||tools.symmetryY||tools.symmetryZ)) {
                 ImGui::Separator();
                 ImGui::TextDisabled(
                     "Симметрия: %s%s%s",
@@ -1064,40 +1342,103 @@ int main(int,char**) {
 
         // Контекст выделения.
         if(!simulating&&!world.placing()&&!world.selection().empty()&&!blockEditor.open) {
-            ImGui::SetNextWindowPos({static_cast<float>(ww)-14.0f,82},ImGuiCond_Always,{1,0});ImGui::SetNextWindowBgAlpha(0.86f);
+            ImGui::SetNextWindowPos({static_cast<float>(ww)-14.0f,82},ImGuiCond_Always,{1,0});
+            ImGui::SetNextWindowBgAlpha(0.86f);
             ImGui::Begin("Выделение",nullptr,ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings);
             ImGui::Text("Выбрано: %zu",world.selection().size());
             ImGui::TextDisabled("Ctrl + ЛКМ — добавить к выбору\nСтрелки — X/Z, PgUp/PgDn — Y");
 
+            if(!blockEditor.active&&ImGui::Button("Сделать новым блоком",{-1,0})) {
+                enterWorkshop(blockEditor,world,camera,library,true);
+                placedConnectionEdit=false;
+            }
+
             if(world.selection().size()==1) {
-                auto id=*world.selection().begin();auto* inst=world.find(id);
+                const auto id=*world.selection().begin();
+                auto* inst=world.find(id);
                 if(inst) {
                     const auto* def=world.definitionFor(*inst,library);
                     ImGui::Separator();
                     ImGui::Text("%s  (#%llu)",def?def->nameRu.c_str():"Блок",static_cast<unsigned long long>(id));
-                    float pos[3]={inst->transform.position.x,inst->transform.position.y,inst->transform.position.z};
-                    if(ImGui::DragFloat3("Позиция",pos,0.01f,-1000,1000,"%.3f"))world.setSingleSelectedPosition({pos[0],pos[1],pos[2]});
-                    float rot[3]={inst->transform.rotationDeg.x,inst->transform.rotationDeg.y,inst->transform.rotationDeg.z};
-                    if(ImGui::DragFloat3("Поворот",rot,1.0f,-360.0f,360.0f,"%.1f°"))world.setSingleSelectedRotation({rot[0],rot[1],rot[2]});
-                    float sc[3]={inst->transform.scale.x,inst->transform.scale.y,inst->transform.scale.z};
-                    if(ImGui::DragFloat3("Масштаб",sc,0.01f,0.02f,20.0f,"%.3f"))world.setSingleSelectedScale({sc[0],sc[1],sc[2]});
 
+                    float pos[3]={inst->transform.position.x,inst->transform.position.y,inst->transform.position.z};
+                    if(ImGui::DragFloat3("Позиция",pos,0.01f,-1000,1000,"%.3f"))
+                        world.setSingleSelectedPosition({pos[0],pos[1],pos[2]});
+
+                    float rot[3]={inst->transform.rotationDeg.x,inst->transform.rotationDeg.y,inst->transform.rotationDeg.z};
+                    if(ImGui::DragFloat3("Поворот",rot,1.0f,-360,360,"%.1f°"))
+                        world.setSingleSelectedRotation({rot[0],rot[1],rot[2]});
+
+                    float scale[3]={inst->transform.scale.x,inst->transform.scale.y,inst->transform.scale.z};
+                    if(ImGui::DragFloat3("Масштаб",scale,0.01f,0.02f,20,"%.3f"))
+                        world.setSingleSelectedScale({scale[0],scale[1],scale[2]});
+
+                    def=world.definitionFor(*inst,library);
                     if(def) {
-                        const double scaleVol=std::abs(inst->transform.scale.x*inst->transform.scale.y*inst->transform.scale.z);
-                        ImGui::Text("Масса: %.3f кг",BlockLibrary::blockMassKg(*def,materials)*scaleVol);
+                        const double volumeScale=std::abs(inst->transform.scale.x*inst->transform.scale.y*inst->transform.scale.z);
+                        ImGui::Text("Масса: %.3f кг",BlockLibrary::blockMassKg(*def,materials)*volumeScale);
                         ImGui::Text("Компонентов: %zu | соединений: %zu",def->components.size(),inst->attachments.size());
-                        if(ImGui::Button("Редактировать компоненты",{-1,0}))blockEditor.editInstance(id,*def);
-                        if(inst->localOverride&&ImGui::Button("Вернуть шаблон из библиотеки",{-1,0}))world.resetLocalOverride(id);
+
+                        std::string materialId=def->components.empty()?"steel_s235":def->components.front().materialId;
+                        bool mixed=false;
+                        for(const auto& component:def->components)
+                            if(component.materialId!=materialId){mixed=true;break;}
+
+                        const char* materialLabel=mixed?"Смешанный материал":materials.get(materialId).nameRu.c_str();
+                        if(ImGui::BeginCombo("Материал блока",materialLabel)) {
+                            for(const auto& material:materials.all()) {
+                                if(ImGui::Selectable(material.nameRu.c_str(),!mixed&&material.id==materialId))
+                                    world.setInstanceMaterial(id,material.id,library);
+                            }
+                            ImGui::EndCombo();
+                        }
+                        if(!mixed) {
+                            const auto& material=materials.get(materialId);
+                            ImGui::TextDisabled("ρ %.0f кг/м³ | E %.1f ГПа | σт %.0f МПа",
+                                material.densityKgM3,material.youngModulusPa/1e9,material.yieldStrengthPa/1e6);
+                        }
+
+                        if(ImGui::Button(blockEditor.geometryInspector?"Скрыть геометрию":"Редактировать геометрию",{-1,0})) {
+                            blockEditor.geometryInspector=!blockEditor.geometryInspector;
+                            blockEditor.selectedComponent=0;
+                        }
+
+                        const bool editing=placedConnectionEdit&&placedConnectionSource==id;
+                        if(ImGui::Button(editing?"Закончить редактирование соединений":"Редактировать соединения",{-1,0})) {
+                            placedConnectionEdit=!editing;
+                            placedConnectionSource=placedConnectionEdit?id:0;
+                        }
+                        if(editing)
+                            ImGui::TextDisabled("Зелёный — соединено. Красный — только касание.\nЛКМ по соседу переключает связь.");
+
+                        if(inst->localOverride&&ImGui::Button("Вернуть шаблон из библиотеки",{-1,0}))
+                            world.resetLocalOverride(id);
                     }
                 }
+            } else {
+                blockEditor.geometryInspector=false;
+                placedConnectionEdit=false;
+                placedConnectionSource=0;
             }
 
-            if(ImGui::Button("Удалить выбранное [Del]",{-1,0}))world.deleteSelected();
+            if(ImGui::Button("Удалить выбранное [Del]",{-1,0})) {
+                world.deleteSelected();
+                blockEditor.geometryInspector=false;
+                placedConnectionEdit=false;
+                placedConnectionSource=0;
+            }
             ImGui::End();
         }
 
+        if(placedConnectionEdit&&
+           (world.selection().size()!=1||!world.isSelected(placedConnectionSource))) {
+            placedConnectionEdit=false;
+            placedConnectionSource=0;
+        }
+
+        drawGeometryInspector(blockEditor,world,library,materials,static_cast<float>(ww));
+
         if(showDebug)drawDebugPressure(pressureLab);
-        drawBlockEditor(blockEditor,library,materials,world,renderer);
 
         // Игровой клик применяется после UI.
         if(requestClick&&!simulating&&!blockEditor.open&&!io.WantCaptureMouse) {
@@ -1140,17 +1481,58 @@ int main(int,char**) {
                 }
             }
             else if(!ImGuizmo::IsUsing()&&!ImGuizmo::IsOver()) {
-                const auto id=world.pick(ray,library);
-                const bool additive=keys[SDL_SCANCODE_LCTRL]||keys[SDL_SCANCODE_RCTRL];
-                world.select(id,additive);
+                const auto clicked=world.pick(ray,library);
+                if(placedConnectionEdit) {
+                    const auto touching=world.touchingIds(placedConnectionSource,library);
+                    const bool canToggle=
+                        world.isAttached(placedConnectionSource,clicked) ||
+                        std::find(touching.begin(),touching.end(),clicked)!=touching.end();
+                    if(clicked&&canToggle)
+                        world.setAttachment(
+                            placedConnectionSource,clicked,
+                            !world.isAttached(placedConnectionSource,clicked),
+                            library
+                        );
+                } else {
+                    const bool additive=keys[SDL_SCANCODE_LCTRL]||keys[SDL_SCANCODE_RCTRL];
+                    world.select(clicked,additive);
+                }
             }
         }
         requestClick=false;
 
         if(requestToggleSim&&!blockEditor.open) {
             if(simulating){physics.clearAssemblies();simulating=false;poses.clear();}
-            else if(!world.instances().empty()){world.pruneInvalidAttachments(library);physics.buildAssemblies(world,library,materials);simulating=physics.assemblyBodyCount()>0;}
+            else if(!world.instances().empty()){
+                world.pruneInvalidAttachments(library);
+                physics.buildAssemblies(world,library,materials);
+                simulating=physics.assemblyBodyCount()>0;
+            }
             requestToggleSim=false;
+        }
+
+        if(requestSaveWorkshop&&blockEditor.active) {
+            if(simulating){physics.clearAssemblies();simulating=false;poses.clear();}
+            if(!world.instances().empty()) {
+                BlockDefinition saved=makeBlockFromScene(
+                    world,library,blockEditor.nameRu,blockEditor.group);
+                if(!saved.components.empty()) {
+                    saved.id=library.makeUniqueId(saved.nameRu);
+                    library.upsert(std::move(saved));
+                }
+            }
+            leaveWorkshop(blockEditor,world,camera);
+            world.cancelPlacement();
+            placedConnectionEdit=false;
+            requestSaveWorkshop=false;
+        }
+
+        if(requestCancelWorkshop&&blockEditor.active) {
+            if(simulating){physics.clearAssemblies();simulating=false;poses.clear();}
+            leaveWorkshop(blockEditor,world,camera);
+            world.cancelPlacement();
+            placedConnectionEdit=false;
+            requestCancelWorkshop=false;
         }
 
         altWasDown=altDown;

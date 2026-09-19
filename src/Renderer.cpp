@@ -1,4 +1,5 @@
 #include "Renderer.hpp"
+#include "GeometryCompiler.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
@@ -187,28 +188,20 @@ void revolve(CpuMesh& mesh,const Mat4& tr,const std::vector<Vec2>& profile,int s
 CpuMesh buildDefinitionMesh(const BlockDefinition& def,const MaterialLibrary& materials) {
     CpuMesh mesh;
 
-    if(BlockLibrary::requiresCsg(def)) {
-        const auto boxes=BlockLibrary::compileVoxelBoxes(def);
-        for(const auto& b:boxes) {
-            const Vec3 color=materials.get(b.materialId).color;
-            box(mesh,translation(b.center),b.size,color);
-        }
-        return mesh;
+    const CompiledGeometry compiled=compileBlockGeometry(def);
+    if(!compiled.valid())return mesh;
+
+    const Vec3 color=materials.get(compiled.materialId).color;
+    mesh.vertices.reserve(compiled.vertices.size());
+
+    for(const auto& v:compiled.vertices) {
+        mesh.vertices.push_back({
+            v.position.x,v.position.y,v.position.z,
+            v.normal.x,v.normal.y,v.normal.z,
+            color.x,color.y,color.z,1.0f
+        });
     }
 
-    for(const auto& c:def.components) {
-        Transform ct; ct.position=c.position; ct.rotationDeg=c.rotationDeg;
-        const Mat4 tr=transformMatrix(ct);
-        const Vec3 color=materials.get(c.materialId).color;
-        switch(c.kind) {
-            case GeometryKind::Box: box(mesh,tr,c.size,color); break;
-            case GeometryKind::Cylinder: cylinder(mesh,tr,c.radius,c.height,c.radialSegments,color); break;
-            case GeometryKind::Sphere: sphere(mesh,tr,c.radius,c.radialSegments,color); break;
-            case GeometryKind::Tube: tube(mesh,tr,c.radius,c.innerRadius,c.height,c.radialSegments,color); break;
-            case GeometryKind::Extrude: extrude(mesh,tr,c.profile,std::max(0.001f,c.size.z),color); break;
-            case GeometryKind::Revolve: revolve(mesh,tr,c.profile,c.radialSegments,color); break;
-        }
-    }
     return mesh;
 }
 

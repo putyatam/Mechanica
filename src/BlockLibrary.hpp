@@ -24,7 +24,16 @@ enum class GeometryKind : int {
 enum class BooleanOp : int {
     Add = 0,
     Subtract = 1,
-    Intersect = 2
+    Intersect = 2,
+    Hull = 3,
+    MinkowskiSum = 4,
+    MinkowskiDifference = 5
+};
+
+enum class ProfilePlane : int {
+    XY = 0,
+    XZ = 1,
+    YZ = 2
 };
 
 struct GeometryComponent {
@@ -32,22 +41,21 @@ struct GeometryComponent {
     std::string name = "Компонент";
     GeometryKind kind = GeometryKind::Box;
     BooleanOp booleanOp = BooleanOp::Add;
+    int operationGroup = 0;
 
     Vec3 position{};
     Vec3 rotationDeg{};
+    Vec3 scale{1.0f,1.0f,1.0f};
 
-    // Box
     Vec3 size{0.5f,0.5f,0.5f};
 
-    // Cylinder / sphere / tube
     float radius = 0.25f;
     float innerRadius = 0.15f;
     float height = 0.5f;
-    int radialSegments = 24;
+    int radialSegments = 64;
 
-    // Extrude: profile.x/y is the 2D contour, depth = size.z.
-    // Revolve: profile.x = radius, profile.y = axial coordinate.
     std::vector<Vec2> profile;
+    ProfilePlane profilePlane = ProfilePlane::XY;
 
     std::string materialId = "steel_s235";
 };
@@ -56,7 +64,7 @@ struct BlockDefinition {
     std::string id;
     std::string nameRu;
     std::string group = "Базовые блоки";
-    int csgResolution = 28;
+    int csgResolution = 20;
     std::vector<GeometryComponent> components;
 };
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Mechanica VERSION 0.4.0 LANGUAGES C CXX)
+project(Mechanica VERSION 0.5.0 LANGUAGES C CXX)
 
 include(FetchContent)
 
@@ -76,6 +76,23 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+# Exact CAD/CSG geometry. Replaces the visible voxel CSG used in 0.4.
+set(MANIFOLD_TEST OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_PYBIND OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_JSBIND OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_CBIND OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_EXPORT OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_PAR OFF CACHE BOOL "" FORCE)
+set(MANIFOLD_CROSS_SECTION ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    manifold
+    GIT_REPOSITORY https://github.com/elalish/manifold.git
+    GIT_TAG v3.5.3
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(manifold)
+
 find_package(OpenGL REQUIRED)
 
 add_library(mechanica_imgui STATIC
@@ -101,6 +118,7 @@ add_executable(Mechanica
     src/BlockLibrary.cpp
     src/BuildWorld.cpp
     src/Continuum.cpp
+    src/GeometryCompiler.cpp
     src/MaterialLibrary.cpp
     src/PhysicsWorld.cpp
     src/Renderer.cpp
@@ -117,6 +135,7 @@ target_link_libraries(Mechanica PRIVATE
     OpenGL::GL
     Jolt
     nlohmann_json::nlohmann_json
+    manifold::manifold
 )
 
 if(MSVC)

@@ -48,12 +48,14 @@ GeometryKind parseKind(std::string_view s) {
     return GeometryKind::Box;
 }
 
-
 const char* booleanName(BooleanOp op) {
     switch(op) {
         case BooleanOp::Add:return "add";
         case BooleanOp::Subtract:return "subtract";
         case BooleanOp::Intersect:return "intersect";
+        case BooleanOp::Hull:return "hull";
+        case BooleanOp::MinkowskiSum:return "minkowski_sum";
+        case BooleanOp::MinkowskiDifference:return "minkowski_difference";
     }
     return "add";
 }
@@ -61,7 +63,25 @@ const char* booleanName(BooleanOp op) {
 BooleanOp parseBoolean(std::string_view s) {
     if(s=="subtract")return BooleanOp::Subtract;
     if(s=="intersect")return BooleanOp::Intersect;
+    if(s=="hull")return BooleanOp::Hull;
+    if(s=="minkowski_sum")return BooleanOp::MinkowskiSum;
+    if(s=="minkowski_difference")return BooleanOp::MinkowskiDifference;
     return BooleanOp::Add;
+}
+
+const char* planeName(ProfilePlane plane) {
+    switch(plane) {
+        case ProfilePlane::XY:return "xy";
+        case ProfilePlane::XZ:return "xz";
+        case ProfilePlane::YZ:return "yz";
+    }
+    return "xy";
+}
+
+ProfilePlane parsePlane(std::string_view s) {
+    if(s=="xz")return ProfilePlane::XZ;
+    if(s=="yz")return ProfilePlane::YZ;
+    return ProfilePlane::XY;
 }
 
 double polygonArea(const std::vector<Vec2>& p) {
@@ -96,30 +116,53 @@ Aabb componentBounds(const GeometryComponent& c) {
         }
         case GeometryKind::Extrude: {
             const float d=std::max(0.001f,c.size.z)*0.5f;
+            const auto includeProfilePoint=[&](const Vec2& p,float sign) {
+                switch(c.profilePlane) {
+                    case ProfilePlane::XY: local.include({p.x,p.y,sign*d}); break;
+                    case ProfilePlane::XZ: local.include({p.x,sign*d,p.y}); break;
+                    case ProfilePlane::YZ: local.include({sign*d,p.x,p.y}); break;
+                }
+            };
             if(c.profile.empty()) {
-                local.include({-0.25f,-0.25f,-d}); local.include({0.25f,0.25f,d});
+                for(const auto& p:std::vector<Vec2>{{-0.25f,-0.25f},{0.25f,0.25f}}) {
+                    includeProfilePoint(p,-1.0f);
+                    includeProfilePoint(p,1.0f);
+                }
             } else {
                 for(const auto& p:c.profile) {
-                    local.include({p.x,p.y,-d}); local.include({p.x,p.y,d});
+                    includeProfilePoint(p,-1.0f);
+                    includeProfilePoint(p,1.0f);
                 }
             }
             break;
         }
         case GeometryKind::Revolve: {
-            float r=0.0f, ymin=0.0f, ymax=0.0f;
+            float r=0.0f, amin=0.0f, amax=0.0f;
             bool first=true;
             for(const auto& p:c.profile) {
                 r=std::max(r,std::abs(p.x));
-                if(first){ymin=ymax=p.y;first=false;}
-                else {ymin=std::min(ymin,p.y);ymax=std::max(ymax,p.y);}
+                if(first){amin=amax=p.y;first=false;}
+                else {amin=std::min(amin,p.y);amax=std::max(amax,p.y);}
             }
-            if(first){r=0.25f;ymin=-0.25f;ymax=0.25f;}
-            local.include({-r,ymin,-r}); local.include({r,ymax,r});
+            if(first){r=0.25f;amin=-0.25f;amax=0.25f;}
+            switch(c.profilePlane) {
+                case ProfilePlane::XY:
+                    local.include({-r,amin,-r}); local.include({r,amax,r});
+                    break;
+                case ProfilePlane::XZ:
+                    local.include({-r,-r,amin}); local.include({r,r,amax});
+                    break;
+                case ProfilePlane::YZ:
+                    local.include({amin,-r,-r}); local.include({amax,r,r});
+                    break;
+            }
             break;
         }
     }
     Transform t;
-    t.position=c.position; t.rotationDeg=c.rotationDeg;
+    t.position=c.position;
+    t.rotationDeg=c.rotationDeg;
+    t.scale=c.scale;
     return transformAabb(local,transformMatrix(t));
 }
 
@@ -162,7 +205,7 @@ bool BlockLibrary::loadOrCreateDefaults() {
             b.id=jb.value("id","");
             b.nameRu=jb.value("nameRu","Без имени");
             b.group=jb.value("group","Базовые блоки");
-            b.csgResolution=std::clamp(jb.value("csgResolution",28),12,64);
+            b.csgResolution=std::clamp(jb.value("csgResolution",20),12,32);
 
             for(const auto& jc:jb.value("components",json::array())) {
                 GeometryComponent c;
@@ -170,14 +213,17 @@ bool BlockLibrary::loadOrCreateDefaults() {
                 c.name=jc.value("name","Компонент");
                 c.kind=parseKind(jc.value("kind","box"));
                 c.booleanOp=parseBoolean(jc.value("booleanOp","add"));
+                c.operationGroup=jc.value("operationGroup",0);
                 c.position=readVec3(jc.value("position",json::array()));
                 c.rotationDeg=readVec3(jc.value("rotationDeg",json::array()));
+                c.scale=readVec3(jc.value("scale",json::array({1.0,1.0,1.0})),{1.0f,1.0f,1.0f});
                 c.size=readVec3(jc.value("size",json::array({0.5,0.5,0.5})),{0.5f,0.5f,0.5f});
                 c.radius=jc.value("radius",0.25f);
                 c.innerRadius=jc.value("innerRadius",0.15f);
                 c.height=jc.value("height",0.5f);
                 c.radialSegments=jc.value("radialSegments",24);
                 c.materialId=jc.value("materialId","steel_s235");
+                c.profilePlane=parsePlane(jc.value("profilePlane","xy"));
                 for(const auto& p:jc.value("profile",json::array())) c.profile.push_back(readVec2(p));
                 b.components.push_back(std::move(c));
             }
@@ -218,14 +264,17 @@ bool BlockLibrary::save() const {
                 jc["name"]=c.name;
                 jc["kind"]=kindName(c.kind);
                 jc["booleanOp"]=booleanName(c.booleanOp);
+                jc["operationGroup"]=c.operationGroup;
                 jc["position"]=vec3Json(c.position);
                 jc["rotationDeg"]=vec3Json(c.rotationDeg);
+                jc["scale"]=vec3Json(c.scale);
                 jc["size"]=vec3Json(c.size);
                 jc["radius"]=c.radius;
                 jc["innerRadius"]=c.innerRadius;
                 jc["height"]=c.height;
                 jc["radialSegments"]=c.radialSegments;
                 jc["materialId"]=c.materialId;
+                jc["profilePlane"]=planeName(c.profilePlane);
                 jc["profile"]=json::array();
                 for(const auto& p:c.profile) jc["profile"].push_back(vec2Json(p));
                 jb["components"].push_back(std::move(jc));
@@ -297,19 +346,28 @@ Aabb BlockLibrary::localBounds(const BlockDefinition& def) {
 }
 
 double BlockLibrary::componentVolume(const GeometryComponent& c) {
+    const double scaleVolume=
+        std::abs(static_cast<double>(c.scale.x)*
+                 static_cast<double>(c.scale.y)*
+                 static_cast<double>(c.scale.z));
+    double baseVolume=0.0;
     switch(c.kind) {
         case GeometryKind::Box:
-            return std::max(0.0f,c.size.x)*std::max(0.0f,c.size.y)*std::max(0.0f,c.size.z);
+            baseVolume=std::max(0.0f,c.size.x)*std::max(0.0f,c.size.y)*std::max(0.0f,c.size.z);
+            break;
         case GeometryKind::Cylinder:
-            return kPi*c.radius*c.radius*std::max(0.0f,c.height);
+            baseVolume=kPi*c.radius*c.radius*std::max(0.0f,c.height);
+            break;
         case GeometryKind::Sphere:
-            return 4.0/3.0*kPi*c.radius*c.radius*c.radius;
+            baseVolume=4.0/3.0*kPi*c.radius*c.radius*c.radius;
+            break;
         case GeometryKind::Tube:
-            return kPi*std::max(0.0f,c.radius*c.radius-c.innerRadius*c.innerRadius)*std::max(0.0f,c.height);
+            baseVolume=kPi*std::max(0.0f,c.radius*c.radius-c.innerRadius*c.innerRadius)*std::max(0.0f,c.height);
+            break;
         case GeometryKind::Extrude:
-            return polygonArea(c.profile)*std::max(0.0f,c.size.z);
+            baseVolume=polygonArea(c.profile)*std::max(0.0f,c.size.z);
+            break;
         case GeometryKind::Revolve: {
-            // Frustum integration between successive profile points.
             if(c.profile.size()<2) return 0.0;
             double volume=0.0;
             for(std::size_t i=0;i+1<c.profile.size();++i) {
@@ -318,10 +376,11 @@ double BlockLibrary::componentVolume(const GeometryComponent& c) {
                 const double h=std::abs(c.profile[i+1].y-c.profile[i].y);
                 volume += kPi*h*(r1*r1+r1*r2+r2*r2)/3.0;
             }
-            return volume;
+            baseVolume=volume;
+            break;
         }
     }
-    return 0.0;
+    return baseVolume*scaleVolume;
 }
 
 double BlockLibrary::blockMassKg(const BlockDefinition& def, const MaterialLibrary& materials) {
@@ -359,7 +418,11 @@ Vec3 toComponentLocal(const GeometryComponent& c,Vec3 p) {
         rotationX(-r.x)*
         rotationY(-r.y)*
         rotationZ(-r.z);
-    return transformVector(inv,d);
+    Vec3 local=transformVector(inv,d);
+    local.x/=std::max(std::abs(c.scale.x),1.0e-6f);
+    local.y/=std::max(std::abs(c.scale.y),1.0e-6f);
+    local.z/=std::max(std::abs(c.scale.z),1.0e-6f);
+    return local;
 }
 
 bool pointInPolygon2D(const std::vector<Vec2>& polygon,Vec2 p) {
@@ -394,12 +457,37 @@ bool pointInside(const GeometryComponent& c,Vec3 worldPoint) {
                    r2>=c.innerRadius*c.innerRadius &&
                    std::abs(p.y)<=c.height*0.5f;
         }
-        case GeometryKind::Extrude:
-            return std::abs(p.z)<=std::max(0.001f,c.size.z)*0.5f &&
-                   pointInPolygon2D(c.profile,{p.x,p.y});
+        case GeometryKind::Extrude: {
+            const float halfDepth=std::max(0.001f,c.size.z)*0.5f;
+            switch(c.profilePlane) {
+                case ProfilePlane::XY:
+                    return std::abs(p.z)<=halfDepth &&
+                           pointInPolygon2D(c.profile,{p.x,p.y});
+                case ProfilePlane::XZ:
+                    return std::abs(p.y)<=halfDepth &&
+                           pointInPolygon2D(c.profile,{p.x,p.z});
+                case ProfilePlane::YZ:
+                    return std::abs(p.x)<=halfDepth &&
+                           pointInPolygon2D(c.profile,{p.y,p.z});
+            }
+            return false;
+        }
         case GeometryKind::Revolve: {
-            const float radius=std::sqrt(p.x*p.x+p.z*p.z);
-            return pointInPolygon2D(c.profile,{radius,p.y});
+            switch(c.profilePlane) {
+                case ProfilePlane::XY: {
+                    const float radius=std::sqrt(p.x*p.x+p.z*p.z);
+                    return pointInPolygon2D(c.profile,{radius,p.y});
+                }
+                case ProfilePlane::XZ: {
+                    const float radius=std::sqrt(p.x*p.x+p.y*p.y);
+                    return pointInPolygon2D(c.profile,{radius,p.z});
+                }
+                case ProfilePlane::YZ: {
+                    const float radius=std::sqrt(p.y*p.y+p.z*p.z);
+                    return pointInPolygon2D(c.profile,{radius,p.x});
+                }
+            }
+            return false;
         }
     }
     return false;
@@ -416,7 +504,7 @@ std::vector<VoxelBox> BlockLibrary::compileVoxelBoxes(const BlockDefinition& def
 
     Vec3 size=bounds.size();
     const float longest=std::max({size.x,size.y,size.z,0.001f});
-    const int target=std::clamp(def.csgResolution,12,64);
+    const int target=std::clamp(def.csgResolution,12,28);
 
     const int nx=std::clamp(static_cast<int>(std::round(target*size.x/longest)),4,target);
     const int ny=std::clamp(static_cast<int>(std::round(target*size.y/longest)),4,target);
@@ -438,6 +526,13 @@ std::vector<VoxelBox> BlockLibrary::compileVoxelBoxes(const BlockDefinition& def
         return static_cast<std::size_t>((z*ny+y)*nx+x);
     };
 
+    std::vector<int> groupOrder;
+    groupOrder.reserve(def.components.size());
+    for(const auto& c:def.components) {
+        if(std::find(groupOrder.begin(),groupOrder.end(),c.operationGroup)==groupOrder.end())
+            groupOrder.push_back(c.operationGroup);
+    }
+
     for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x) {
         const Vec3 p{
             bounds.min.x+(x+0.5f)*cell.x,
@@ -448,18 +543,43 @@ std::vector<VoxelBox> BlockLibrary::compileVoxelBoxes(const BlockDefinition& def
         bool occupied=false;
         int mat=-1;
 
-        for(std::size_t ci=0;ci<def.components.size();++ci) {
-            const auto& c=def.components[ci];
-            const bool inside=pointInside(c,p);
+        for(int groupId:groupOrder) {
+            bool groupOccupied=false;
+            int groupMat=-1;
+            bool seeded=false;
 
-            if(c.booleanOp==BooleanOp::Add) {
-                if(inside){occupied=true;mat=static_cast<int>(ci);}
+            for(std::size_t ci=0;ci<def.components.size();++ci) {
+                const auto& c=def.components[ci];
+                if(c.operationGroup!=groupId)continue;
+
+                const bool inside=pointInside(c,p);
+
+                if(!seeded) {
+                    groupOccupied=inside;
+                    groupMat=inside?static_cast<int>(ci):-1;
+                    seeded=true;
+                    continue;
+                }
+
+                switch(c.booleanOp) {
+                    case BooleanOp::Add:
+                    case BooleanOp::Hull:
+                    case BooleanOp::MinkowskiSum:
+                    case BooleanOp::MinkowskiDifference:
+                        if(inside){groupOccupied=true;groupMat=static_cast<int>(ci);}
+                        break;
+                    case BooleanOp::Subtract:
+                        if(inside){groupOccupied=false;groupMat=-1;}
+                        break;
+                    case BooleanOp::Intersect:
+                        if(groupOccupied&&!inside){groupOccupied=false;groupMat=-1;}
+                        break;
+                }
             }
-            else if(c.booleanOp==BooleanOp::Subtract) {
-                if(inside){occupied=false;mat=-1;}
-            }
-            else if(c.booleanOp==BooleanOp::Intersect) {
-                if(occupied&&!inside){occupied=false;mat=-1;}
+
+            if(groupOccupied) {
+                occupied=true;
+                mat=groupMat;
             }
         }
 
